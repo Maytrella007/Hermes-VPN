@@ -1,0 +1,140 @@
+#!/bin/bash
+# /usr/local/sbin/vpn-relay-setup <profile> [--remove]
+#
+# Gives ONE Hermes profile its own way out: an --internal network that only it
+# and its own relay sit on, and a relay whose upstream is that profile's file.
+#
+# Why one per profile and not one shared: the relay's upstream *is* the country.
+# One relay for several sandboxes means one country for all of them, so changing
+# a bot's country silently moves every other bot -- and each profile keeps its own
+# idea of which exit it chose, so the two disagree and the plugin reports a
+# country that bot does not have. With one relay each, "this bot in Japan and
+# that one in Russia" is just two files.
+#
+# What the sandbox sees does not change: `vpn-exit` is still the proxy's name,
+# because the alias is per network. No policy inside any container is rewritten.
+#
+# Idempotent: every step is skipped when it is already done. Nothing is
+# recreated, so a running bot keeps its PIDs -- joining a network is live.
+set -uo pipefail
+
+PROFILE=${1:?usage: vpn-relay-setup <profile> [--remove]}
+MODE=${2:-}
+#: The network the exits share. `vpn-exit up` creates it and joins every exit
+#: to it, so a relay addresses them by name and nothing has to sit on the
+#: default bridge, where it would be reachable from every other container.
+EXITS_NET=${VPN_EXITS_NET:-hermes-exits}
+RELAY_DIR=${VPN_RELAY_DIR:-/root/vpn-relay}
+NET="hermes-vpn-$PROFILE"
+RELAY="vpn-relay-$PROFILE"
+UPSTREAM="$RELAY_DIR/upstream/$PROFILE"
+
+say() { printf '  %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ $PROFILE =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "not a profile name: '$PROFILE'"
+[[ -f $RELAY_DIR/vpn-relay.py ]] || die "no relay script at $RELAY_DIR/vpn-relay.py"
+
+# ------------------------------------------------------------------ remove ----
+if [[ $MODE == "--remove" ]]; then
+  docker rm -f "$RELAY" >/dev/null 2>&1 && say "removed $RELAY"
+  docker network rm "$NET" >/dev/null 2>&1 && say "removed network $NET"
+  say "left $UPSTREAM in place; delete it by hand if you mean to forget the choice"
+  exit 0
+fi
+
+# ------------------------------------------------------------- the network ----
+# No explicit subnet: Docker picks a free one. Naming subnets by hand is how two
+# profiles end up wanting the same /24.
+if docker network inspect "$NET" >/dev/null 2>&1; then
+  [[ $(docker network inspect "$NET" -f '{{.Internal}}') == true ]] \
+    || die "$NET exists but is not --internal; a sandbox on it would have a way out"
+  say "network $NET already there (internal)"
+else
+  docker network create --internal "$NET" >/dev/null || die "could not create $NET"
+  say "created network $NET (internal: no route off this host)"
+fi
+
+if docker network inspect "$EXITS_NET" >/dev/null 2>&1; then
+  say "exits network $EXITS_NET already there"
+else
+  # Created here rather than demanded. Requiring it meant a reader who had
+  # just been told to open an exit was then told to "bring the exits up
+  # first" -- and the exit they had opened was on the default bridge, which a
+  # relay must not join.
+  docker network create "$EXITS_NET" >/dev/null || die "could not create $EXITS_NET"
+  say "created network $EXITS_NET (the exits and the relays share it)"
+fi
+
+# ------------------------------------------------------------ the upstream ----
+# Seeded from whatever is already chosen so a new relay does not start with no
+# The country is the user's to choose. At setup time there may be no
+# credentials and no exits at all, so picking "the first one running" would
+# either fail here or send a bot somewhere nobody asked for. The file is
+# created empty: the relay reads it on every connection and refuses while it
+# is empty, so the profile fails shut until a country is chosen.
+if [[ -s $UPSTREAM ]]; then
+  say "country already chosen: $(cat "$UPSTREAM")"
+else
+  mkdir -p "$(dirname "$UPSTREAM")"
+  if [[ -s $RELAY_DIR/upstream/upstream ]]; then
+    # One case carries a value over: a migration from the single shared relay,
+    # where this profile was already going out by that country.
+    cp "$RELAY_DIR/upstream/upstream" "$UPSTREAM"
+    say "carried over the shared relay's country: $(cat "$UPSTREAM")"
+  else
+    : > "$UPSTREAM"
+    say "no country chosen yet: nothing in this profile reaches the internet"
+    say "until \`hermes vpn use <place>\` picks one"
+  fi
+  chmod 644 "$UPSTREAM"
+fi
+
+# --------------------------------------------------------------- the relay ----
+if docker inspect "$RELAY" >/dev/null 2>&1; then
+  say "relay $RELAY already there"
+else
+  # Deliberately NOT on the default bridge. The shared relay was attached to it,
+  # which made it an unauthenticated open proxy to every container on the host:
+  # anything started without --network got free VPN egress. It needs exactly two
+  # networks -- the profile's, to be reached, and the exits', to reach.
+  docker run -d --name "$RELAY" \
+    --restart unless-stopped \
+    --network "$NET" --network-alias vpn-exit \
+    -e LISTEN_PORT=8888 -e "UPSTREAM_FILE=/upstream/$PROFILE" \
+    -v "$RELAY_DIR/vpn-relay.py:/vpn-relay.py:ro" \
+    -v "$RELAY_DIR/upstream:/upstream:ro" \
+    python:3.12-alpine python3 -I /vpn-relay.py >/dev/null \
+    || die "could not start $RELAY"
+  docker network connect "$EXITS_NET" "$RELAY" || die "could not put $RELAY on $EXITS_NET"
+  say "started $RELAY on $NET (as vpn-exit) and $EXITS_NET"
+fi
+
+# ------------------------------------------------------------------ checks ----
+sleep 1
+[[ $(docker inspect "$RELAY" -f '{{.State.Running}}') == true ]] \
+  || die "$RELAY is not running: docker logs $RELAY"
+
+nets=$(docker inspect "$RELAY" -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')
+# -qxF against one name per line: `-w` treats `-` as a word boundary, so a
+# network called `hermes-bridge-net` matched `bridge`.
+grep -qxF bridge <<<"$(tr ' ' '\n' <<<"$nets")" \
+  && say "WARNING: $RELAY is on the default bridge — it is an open proxy there"
+
+cat <<EOF
+
+$PROFILE now has its own way out.
+
+  network   $NET (internal)
+  relay     $RELAY, reachable inside as vpn-exit:8888
+  country   $UPSTREAM  ->  $(cat "$UPSTREAM")
+
+Next, move that profile's sandbox onto it — live, without recreating it:
+
+  vpn-migrate <container> $PROFILE
+
+and make future sandboxes be born there, in the profile's config.yaml:
+
+  terminal:
+    docker_extra_args: ["--network=$NET"]
+EOF

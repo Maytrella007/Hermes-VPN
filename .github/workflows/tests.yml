@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  # A branch pushed for a pull request would otherwise run the matrix twice.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here writes anything back.
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every version that breaks, not only the first one.
+      fail-fast: false
+      matrix:
+        # 3.12 is what the server runs; the other two are the edges we support.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The plugin has no dependencies, so neither does its suite: no install step.
+      - run: python -m unittest discover -s tests -t . -v

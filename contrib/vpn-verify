@@ -1,0 +1,143 @@
+#!/bin/bash
+# /usr/local/bin/vpn-verify <container> [expected-country-code]
+#
+# Confirms, FROM INSIDE the sandbox, that the VPN egress is actually in force.
+# Fail-closed: any check that cannot be confirmed exits non-zero with a reason.
+# Run it after every country switch, before letting the agent browse.
+#
+# Exit codes
+#   0  all checks passed (prints "OK <ip> <cc>")
+#   2  topology wrong   (sandbox is on a non-internal network, or extra networks)
+#   3  direct egress possible (route/TCP/UDP/DNS leak path open)
+#   4  exit IP could not be confirmed through the proxy
+#   5  exit country is not the expected one
+set -uo pipefail
+
+SB=${1:?usage: vpn-verify <container> [expected-cc]}
+WANT=${2:-}
+# Discovered, not assumed. The network is named per profile now
+# (hermes-vpn-<profile>), and a verifier that insists on one name would pass a
+# sandbox on a different one -- or fail a correct setup. What matters is the
+# property, not the name: exactly one network, and that one internal.
+NET=${VPN_NET:-}
+PROXY=${VPN_PROXY:-http://vpn-exit:8888}
+
+fail() { printf 'VPN-VERIFY FAIL(%d): %s\n' "$1" "$2" >&2; exit "$1"; }
+
+# ---- 1. topology, from the host, no exec: ~25 ms -----------------------------
+# NOTE: do NOT use .HostConfig.NetworkMode -- it keeps saying "bridge" after a
+# live migration. Only .NetworkSettings.Networks reflects reality.
+nets=$(docker inspect "$SB" -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null) \
+  || fail 2 "container $SB not found"
+read -ra arr <<<"$nets"
+[[ ${#arr[@]} -eq 1 ]] || fail 2 "sandbox is on ${#arr[@]} networks (${nets}); it must be on exactly one"
+[[ -z $NET || ${arr[0]} == "$NET" ]] || fail 2 "sandbox is on ${arr[0]}, not $NET"
+NET=${arr[0]}
+[[ $(docker network inspect "$NET" -f '{{.Internal}}' 2>/dev/null) == "true" ]] \
+  || fail 2 "network $NET is not --internal, so the sandbox has a way out that is not the tunnel"
+
+# ---- 2. no direct egress, from inside, no network I/O: ~250 ms ---------------
+# A single exec does route + TCP + UDP + DNS. UDP being unreachable is also the
+# WebRTC check: ICE cannot produce an srflx candidate without UDP egress, so
+# this replaces launching a browser (~10 s) with a few milliseconds.
+probe=$(docker exec "$SB" python3 -I -c '
+import socket
+bad = []
+
+# Two different facts, and only one of them is this script business.
+#
+# A path to the INTERNET that is not the tunnel breaks the guarantee: that is a
+# failure. Reaching THIS HOST does not -- sshd is not a way to load a page or
+# leak an address -- and whether the host answers on port 22 is the operator
+# policy, not the plugin. --internal only installs FORWARD-chain drops, so
+# traffic to the host goes through INPUT untouched; a verifier that failed over
+# it would be imposing an opinion about someone else machine. So it is
+# reported and the check passes.
+#
+# The gateway is derived from the on-link route: the host end of a docker
+# bridge is the subnet .1.
+gateway = None
+with open("/proc/net/route") as handle:
+    for line in handle.readlines()[1:]:
+        bits = line.split()
+        if bits[1] == "00000000":
+            bad.append("default-route-present")
+            continue
+        if gateway is None:
+            packed = int(bits[1], 16).to_bytes(4, "little")
+            gateway = "%d.%d.%d.1" % (packed[0], packed[1], packed[2])
+
+def answers(kind, where, timeout=2):
+    sock = socket.socket(socket.AF_INET, kind)
+    sock.settimeout(timeout)
+    try:
+        if kind == socket.SOCK_STREAM:
+            sock.connect(where)
+        else:
+            sock.sendto(b"\\x00", where)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+if answers(socket.SOCK_STREAM, ("1.1.1.1", 443)):
+    bad.append("tcp-direct")
+if answers(socket.SOCK_DGRAM, ("8.8.8.8", 53)):
+    bad.append("udp-direct")
+
+# Reported, not failed. 2375/2376 would be the docker API, which is the one
+# that would matter: it is root on the host, so it is named separately.
+host = []
+if gateway:
+    for port in (22, 2222, 2375, 2376):
+        if answers(socket.SOCK_STREAM, (gateway, port), 1):
+            host.append(str(port))
+
+try:
+    socket.gethostbyname("cloudflare.com")
+    bad.append("dns-external")
+except OSError:
+    pass
+
+print((";".join(bad) if bad else "SEALED") + "|" + ",".join(host))
+' 2>&1) || fail 3 "egress probe could not run inside $SB: $probe"
+verdict=${probe%%|*}
+host_ports=${probe#*|}
+[[ $verdict == "SEALED" ]] || fail 3 "direct egress path open: $verdict"
+if [[ -n $host_ports ]]; then
+  # stderr, so stdout stays the one line a caller parses as a measurement.
+  printf 'NOTE: from inside %s this host answers on port(s) %s. That is not a way to the\n' "$SB" "$host_ports" >&2
+  printf '      internet and does not affect the exit; it is this host own firewall policy.\n' >&2
+  case ",$host_ports," in *,2375,*|*,2376,*)
+    printf 'WARNING: one of those is the docker API, which is root on this host.\n' >&2 ;;
+  esac
+fi
+
+# ---- 3. exit IP, from inside, through the proxy: ~250-700 ms ----------------
+# Cloudflare's trace endpoint: no rate limit, tiny body, gives ip AND country.
+# --noproxy "": curl honours no_proxy even when --proxy is given, so without
+# it a no_proxy set inside the sandbox would make this measure the container's
+# own egress and report it as the exit's. The same hole was closed in look().
+trace=$(docker exec "$SB" curl -sf --noproxy "" --max-time 8 --proxy "$PROXY" \
+          https://1.1.1.1/cdn-cgi/trace 2>/dev/null) \
+  || fail 4 "could not reach 1.1.1.1/cdn-cgi/trace through $PROXY"
+ip=$(sed -n 's/^ip=//p'  <<<"$trace")
+cc=$(sed -n 's/^loc=//p' <<<"$trace")
+[[ -n $ip && -n $cc ]] || fail 4 "trace did not yield ip/loc: $(tr '\n' ' ' <<<"$trace")"
+
+# ---- 4. the exit must not be the host's own address -------------------------
+host_ip=$(curl -sf --noproxy "*" --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null \
+  | sed -n 's/^ip=//p')
+# Fail closed, as this script's header promises. Without the host's own address
+# there is nothing to compare against, and this is the one check that catches
+# "not on the VPN at all".
+[[ -n $host_ip ]] || fail 4 "this host's own address could not be measured, so the exit could not be compared against it"
+[[ $ip == "$host_ip" ]] && fail 3 "sandbox exit IP == host IP ($ip): NOT on the VPN"
+
+# ---- 5. expected country ----------------------------------------------------
+if [[ -n $WANT && ${cc^^} != ${WANT^^} ]]; then
+  fail 5 "exit is in $cc, expected $WANT (ip=$ip)"
+fi
+
+printf 'OK %s %s\n' "$ip" "$cc"

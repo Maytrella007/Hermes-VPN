@@ -1,0 +1,21 @@
+# One Tor, no pinned exit country. Pinning one with `ExitNodes {jp} StrictNodes 1`
+# works, but it shrinks the set of relays the circuit can use, weakens what Tor
+# is for, and fails outright when that country has no exit available. A country
+# is what the VPN exits are for; this is for the other thing.
+
+# Loopback, and loopback means something precise here: privoxy shares this
+# container's network namespace, so it reaches the tunnel without the tunnel
+# being reachable by anything else on the exits network. The HTTP front is the
+# only way in.
+SocksPort 9050
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy reject *
+
+# For `SIGNAL NEWNYM` (a new circuit) in phase 3. Cookie authentication, and
+# the port is never published: whoever wants it goes through `docker exec`, so
+# no control secret has to live on the host where the agent could read it.
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+
+DataDirectory /var/lib/tor
+Log notice stdout

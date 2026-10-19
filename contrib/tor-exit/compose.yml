@@ -1,0 +1,55 @@
+# The Tor exit, as two services from one image. Add them to the compose file
+# that already holds your exits (/root/vpn-exits/docker-compose.yml), or run
+# this file on its own with `docker compose -f compose.yml up -d`.
+#
+# They share one network namespace: `exit-tor` holds the address and the
+# published port, and privoxy runs beside it. That is what lets Tor's SOCKS
+# port stay on loopback while the HTTP front is the only way in.
+services:
+  exit-tor:
+    build: .
+    image: hermes-vpn/tor-exit:latest
+    container_name: exit-tor
+    restart: unless-stopped
+    labels:
+      # What makes this an exit: the helper accepts a container with this
+      # label, so a sandbox can be pointed at it like at any other, and the
+      # plugin discovers it for the same reason.
+      managed-by: vpn-exit
+      # What a reader sees in `hermes vpn list`, and nothing more. The country
+      # failover matches on is read from a tunnel's own environment, so this
+      # exit stands in for nothing and nothing stands in for it -- which is
+      # the only honest answer when the country changes with the circuit.
+      exit-provider: tor
+      exit-country: Tor
+    networks: [hermes-exits]
+    ports:
+      # privoxy's port, published on loopback only. A proxy published on
+      # 0.0.0.0 is an open relay, and this plugin's own discovery refuses to
+      # treat one as an exit.
+      - "127.0.0.1:8899:8888"
+    healthcheck:
+      # Tor answers SOCKS before it has a circuit, so a port check would call
+      # it healthy while it is still bootstrapping. Ask the far end instead.
+      test: ["CMD", "curl", "-sf", "--max-time", "10", "--socks5-hostname",
+             "127.0.0.1:9050", "https://check.torproject.org/api/ip"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+
+  exit-tor-http:
+    build: .
+    image: hermes-vpn/tor-exit:latest
+    container_name: exit-tor-http
+    restart: unless-stopped
+    depends_on: [exit-tor]
+    user: privoxy
+    command: ["privoxy", "--no-daemon", "/etc/privoxy/config"]
+    # No network of its own: it lives in Tor's, which is how it reaches 9050
+    # on loopback and how its listener ends up behind `exit-tor`'s address.
+    network_mode: "service:exit-tor"
+
+networks:
+  hermes-exits:
+    external: true

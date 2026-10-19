@@ -1,0 +1,307 @@
+#!/bin/bash
+# contrib/install [--apply] [--user <name>] [--check-rule <file>]
+#
+# Puts the host-side pieces of hermes-vpn in place. Run it as root, from the
+# plugin directory.
+#
+# It prints what it would do and changes nothing until you pass --apply. That
+# is not politeness: this installs a sudo rule and a root-owned helper, and you
+# should read the list before any of it happens.
+#
+# What it deliberately does NOT do:
+#
+#   * write your VPN credentials. It creates the file and tells you what goes
+#     in it. The one thing the helper exists to protect is that file, and a
+#     script that filled it in would have had to handle the secret.
+#   * decide your firewall. A sealed sandbox has no path to the internet; it is
+#     still on a network whose gateway is this host, and whether this host
+#     answers on port 22 is your business.
+#   * claim success. It finishes by running `hermes vpn doctor`, which measures.
+#     An installer's own report that it worked is worth very little.
+#
+# Idempotent: every step is skipped when it is already done, so re-running it
+# after fixing one thing is the expected way to use it.
+#
+# --check-rule prints the grant a rule file holds, or refuses it and says why,
+# and does nothing else. It needs no root, and it is how the tests exercise
+# this check rather than a copy of it.
+set -uo pipefail
+
+APPLY=no
+AGENT_USER=hermes
+CHECK_RULE=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --apply) APPLY=yes; shift ;;
+        --user)  AGENT_USER=${2:?--user needs a name}; shift 2 ;;
+        --check-rule) CHECK_RULE=${2:?--check-rule needs a path}; shift 2 ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+EXIT_DIR=/root/vpn-exits
+RELAY_DIR=/root/vpn-relay
+SUDOERS=/etc/sudoers.d/vpn-exit
+
+planned=0
+problems=0
+
+step() { printf '\n%s\n' "$*"; }
+would() { planned=$((planned + 1)); printf '  %s %s\n' "$([[ $APPLY == yes ]] && echo 'doing:' || echo 'would:')" "$*"; }
+ok()    { printf '  already: %s\n' "$*"; }
+bad()   { problems=$((problems + 1)); printf '  PROBLEM: %s\n' "$*"; }
+run()   { [[ $APPLY == yes ]] || return 0; "$@" || { bad "failed: $*"; return 1; }; }
+
+# Reads the grant out of a rule file into $RULE, or sets $RULE_PROBLEM and
+# returns 1 for one this will not install. An absent or comment-only file is
+# neither: $RULE comes back empty and section 2 reports it.
+#
+# The line has to match the expected grant whole. Holding the helper's path
+# is not a check: `NOPASSWD: ALL, /usr/local/sbin/vpn-exit` holds it, passes
+# `visudo -cq`, and grants the entire host. Nor is the path the only field
+# that matters, since `ALL ALL=(ALL) NOPASSWD: <path>` hands the helper to
+# every account instead of one.
+RULE=""
+RULE_PROBLEM=""
+read_rule() {
+    local file=$1 user=$2 want line trimmed count=0
+    want="$user ALL=(root) NOPASSWD: /usr/local/sbin/vpn-exit"
+    RULE=""
+    RULE_PROBLEM=""
+    [[ -r $file ]] || return 0
+    # `|| [[ -n $line ]]` so a file with no trailing newline keeps its last
+    # line, which is the line that matters here.
+    while IFS= read -r line || [[ -n $line ]]; do
+        trimmed=${line#"${line%%[![:space:]]*}"}
+        trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+        [[ -z $trimmed || $trimmed == \#* ]] && continue
+        count=$((count + 1))
+        RULE=${trimmed//@AGENT_USER@/$user}
+    done < "$file"
+    if [[ $count -gt 1 ]]; then
+        RULE_PROBLEM="$file holds $count rules. This writes a single line, so every one but the last would have been dropped without saying so. Refusing."
+        return 1
+    fi
+    [[ -z $RULE ]] && return 0
+    if grep -qiE 'SETENV|env_keep' <<<"$RULE"; then
+        RULE_PROBLEM="$file relaxes the environment (SETENV or env_keep). Refusing to install it: the helper takes several VPN_EXIT_* overrides, and a rule without SETENV is what keeps them from becoming an arbitrary root read, write and delete."
+        return 1
+    fi
+    if [[ $RULE != "$want" ]]; then
+        RULE_PROBLEM=$(printf '%s is not the grant this installs, so nothing was written.\n    it says:  %s\n    expected: %s' "$file" "$RULE" "$want")
+        return 1
+    fi
+    return 0
+}
+
+if [[ -n $CHECK_RULE ]]; then
+    if ! read_rule "$CHECK_RULE" "$AGENT_USER"; then
+        printf '%s\n' "$RULE_PROBLEM" >&2
+        exit 1
+    fi
+    [[ -n $RULE ]] || { printf 'no rule in %s\n' "$CHECK_RULE" >&2; exit 2; }
+    printf '%s\n' "$RULE"
+    exit 0
+fi
+
+[[ $(id -u) -eq 0 ]] || { printf 'Run this as root: it installs a root helper and a sudo rule.\n' >&2; exit 1; }
+id "$AGENT_USER" >/dev/null 2>&1 || { printf 'No user %s on this host (pass --user).\n' "$AGENT_USER" >&2; exit 1; }
+command -v docker >/dev/null || bad "docker is not installed; the exits and the relay both need it"
+
+printf 'hermes-vpn host setup'
+[[ $APPLY == yes ]] && printf ' (APPLYING)\n' || printf ' (dry run — nothing will change; add --apply)\n'
+printf 'plugin at %s, agent user %s\n' "$HERE" "$AGENT_USER"
+
+# ----------------------------------------------------------- the helpers ----
+step "1. the helpers"
+install_helper() {
+    local src=$1 dest=$2 mode=$3
+    [[ -f $HERE/$src ]] || { bad "$HERE/$src is missing"; return; }
+    if [[ -f $dest ]] && cmp -s "$HERE/$src" "$dest"; then
+        ok "$dest is current"
+        return
+    fi
+    [[ -f $dest ]] && would "replace $dest (keeping a .bak)" || would "install $dest (mode $mode)"
+    if [[ $APPLY == yes ]]; then
+        [[ -f $dest ]] && cp -a "$dest" "$dest.bak-$(date +%Y%m%d-%H%M%S)"
+        run install -m "$mode" -o root -g root "$HERE/$src" "$dest"
+    fi
+}
+install_helper vpn-exit            /usr/local/sbin/vpn-exit            750
+install_helper vpn-relay-setup     /usr/local/sbin/vpn-relay-setup     750
+install_helper vpn-profile-network /usr/local/sbin/vpn-profile-network 750
+install_helper vpn-verify          /usr/local/bin/vpn-verify           755
+install_helper vpn-migrate         /usr/local/bin/vpn-migrate          755
+
+# ------------------------------------------------------------ the sudo rule ----
+step "2. the sudo rule"
+# The rule lives in contrib/vpn-exit.sudoers so the whole privilege is a line
+# the reader can open with its reasoning around it. read_rule checks that line
+# against the one grant this installs, before writing rather than after, so a
+# checkout saying something broader is refused instead of syntax-checked.
+RULE_FILE=$HERE/vpn-exit.sudoers
+if ! read_rule "$RULE_FILE" "$AGENT_USER"; then
+    bad "$RULE_PROBLEM"
+    exit 1
+fi
+
+if [[ -z $RULE ]]; then
+    bad "no rule to install: $RULE_FILE is missing, unreadable, or carries only comments"
+elif [[ -f $SUDOERS ]] && grep -qxF "$RULE" "$SUDOERS"; then
+    ok "$SUDOERS grants exactly that one path"
+    grep -qiE 'SETENV|env_keep' "$SUDOERS" \
+        && bad "$SUDOERS also relaxes the environment. Do not: the helper takes several VPN_EXIT_* overrides, and only a rule without SETENV keeps them from becoming an arbitrary root read, write and delete."
+elif [[ -f $SUDOERS ]]; then
+    bad "$SUDOERS exists and says something else; leaving it alone. It should be exactly the line in $RULE_FILE: $RULE"
+else
+    printf '  the rule, from %s:\n    %s\n' "${RULE_FILE#"$HERE"/}" "$RULE"
+    would "write $SUDOERS with that line"
+    would "chmod 440 $SUDOERS"
+    if [[ $APPLY == yes ]]; then
+        printf '%s\n' "$RULE" > "$SUDOERS.new" && chmod 440 "$SUDOERS.new"
+        # Checked before it is in place: a bad sudoers file can lock you out.
+        if visudo -cqf "$SUDOERS.new" 2>/dev/null; then
+            run mv "$SUDOERS.new" "$SUDOERS"
+        else
+            rm -f "$SUDOERS.new"
+            bad "the sudo rule did not pass visudo; nothing was installed"
+        fi
+    fi
+fi
+
+# ------------------------------------------------------- credentials, yours ----
+step "3. where your VPN credentials go (this script will not write them)"
+[[ -d $EXIT_DIR ]] || would "mkdir -m 700 $EXIT_DIR"
+run mkdir -p "$EXIT_DIR"
+run chmod 700 "$EXIT_DIR"
+[[ -d $EXIT_DIR/secrets ]] || would "mkdir -m 700 $EXIT_DIR/secrets (one file per secret, mounted read-only into each exit)"
+run mkdir -p "$EXIT_DIR/secrets"
+run chmod 700 "$EXIT_DIR/secrets"
+
+if [[ -s $EXIT_DIR/.env ]]; then
+    ok "$EXIT_DIR/.env exists ($(stat -c %a "$EXIT_DIR/.env"), $(stat -c %U "$EXIT_DIR/.env"))"
+    [[ $(stat -c %a "$EXIT_DIR/.env") == 600 ]] || bad "$EXIT_DIR/.env should be mode 600"
+else
+    would "write a commented template at $EXIT_DIR/.env (mode 600) for YOU to fill in"
+    if [[ $APPLY == yes ]]; then
+        cat > "$EXIT_DIR/.env" <<'TEMPLATE'
+# Your VPN's credentials. Root-only, and the agent never reads this file: it
+# asks the helper for a country, and the helper does the privileged part.
+#
+# `hermes vpn provider <name>` prints what your provider needs, from a guide
+# shipped with the plugin -- no searching. Then put those variables here, one
+# per line, NAME=value, with no quotes and no `export`.
+#
+# Surfshark with WireGuard, as an example:
+#
+# VPN_SERVICE_PROVIDER=surfshark
+# VPN_TYPE=wireguard
+# WIREGUARD_PRIVATE_KEY=...
+# WIREGUARD_ADDRESSES=10.14.0.2/16
+#
+# One file per provider is fine: name it <provider>.env in this directory and
+# pass `--provider <provider>`.
+TEMPLATE
+        chmod 600 "$EXIT_DIR/.env"
+        bad "fill in $EXIT_DIR/.env before opening an exit (that is the one step nobody can do for you)"
+    fi
+fi
+
+# ---------------------------------------------------------------- the relay ----
+step "4. the relay, for profiles whose terminal is a container"
+[[ -d $RELAY_DIR/upstream ]] || would "mkdir -p $RELAY_DIR/upstream"
+run mkdir -p "$RELAY_DIR/upstream"
+if [[ -f $RELAY_DIR/vpn-relay.py ]] && cmp -s "$HERE/vpn-relay.py" "$RELAY_DIR/vpn-relay.py"; then
+    ok "$RELAY_DIR/vpn-relay.py is current"
+else
+    would "install $RELAY_DIR/vpn-relay.py"
+    run install -m 644 -o root -g root "$HERE/vpn-relay.py" "$RELAY_DIR/vpn-relay.py"
+fi
+
+# --------------------------------------------------------------- the profiles ----
+step "5. profiles that browse from a container"
+HERMES_HOME_DIR=$(getent passwd "$AGENT_USER" | cut -d: -f6)/.hermes
+sandboxed=()
+if [[ -d $HERMES_HOME_DIR/profiles ]]; then
+    for config in "$HERMES_HOME_DIR"/profiles/*/config.yaml; do
+        [[ -f $config ]] || continue
+        # Strip comments, then match the key: `backend: docker  # note`,
+        # single quotes and extra spaces are all the same setting.
+        #
+        # Process substitution, not a pipe. Under `set -o pipefail` `grep -q`
+        # exits at the first match while sed is still writing, sed takes
+        # SIGPIPE, and the pipeline reports failure even though we matched.
+        # That needs more than 64 KiB (the pipe capacity) still to come after
+        # the match, so it passes on a small config.yaml and fails on a big
+        # one: quiet until it isn't.
+        #
+        # Match the whole value, like netexits.BACKEND_DOCKER does. `\b`
+        # matches before a hyphen, so `backend: docker-compose` would read as
+        # a sandbox and we would set up a relay for it.
+        if grep -qE "backend[[:space:]]*:[[:space:]]*['\"]?docker['\"]?[[:space:]]*([,}]|$)" \
+               <(sed 's/#.*//' "$config"); then
+            sandboxed+=("$(basename "$(dirname "$config")")")
+        fi
+    done
+fi
+
+if [[ ${#sandboxed[@]} -eq 0 ]]; then
+    ok "none — this host browses on the host itself, so no relay is needed"
+else
+    printf '  found: %s\n' "${sandboxed[*]}"
+    if grep -q . < <(docker ps --filter 'name=^exit-' --format '{{.Names}}'); then
+        for profile in "${sandboxed[@]}"; do
+            if docker network inspect "hermes-vpn-$profile" >/dev/null 2>&1; then
+                ok "$profile already has hermes-vpn-$profile"
+            else
+                would "vpn-relay-setup $profile   (its own sealed network and its own relay)"
+                if ! run /usr/local/sbin/vpn-relay-setup "$profile"; then
+                    # Without this the next step still ran, and since the relay
+                    # setup creates the network before it can fail, the profile
+                    # was pointed at a sealed network with no relay on it --
+                    # every future sandbox for it born with no way out at all.
+                    bad "$profile was left alone: its relay is not up, so its config was not pointed at hermes-vpn-$profile"
+                    continue
+                fi
+            fi
+            if grep -q -- "--network=hermes-vpn-$profile" \
+                 "$HERMES_HOME_DIR/profiles/$profile/config.yaml" 2>/dev/null; then
+                ok "$profile's config already points its next container at hermes-vpn-$profile"
+            else
+                would "vpn-profile-network $profile   (so its next container is born sealed)"
+                [[ $APPLY == yes ]] && /usr/local/sbin/vpn-profile-network "$profile" \
+                    --hermes-home "$HERMES_HOME_DIR"
+            fi
+            printf '  then, for the sandbox running right now: vpn-migrate <container> %s\n' "$profile"
+        done
+    else
+        bad "no exit is running yet, so a relay has nothing to point at. Open one first (\`hermes vpn open <country>\` once the credentials are in), then re-run this."
+    fi
+fi
+
+# ------------------------------------------------------------------ the verdict ----
+step "6. the check that measures instead of claiming"
+if [[ $APPLY == yes ]]; then
+    printf '  running `hermes vpn doctor` as %s:\n\n' "$AGENT_USER"
+    su - "$AGENT_USER" -c 'hermes vpn doctor' 2>&1 | sed 's/^/    /'
+else
+    would "run \`hermes vpn doctor\` as $AGENT_USER and show you what it says"
+fi
+
+printf '\n'
+if [[ $APPLY != yes ]]; then
+    if [[ $planned -eq 0 ]]; then
+        printf 'Nothing to do: this host is already set up.\n'
+    else
+        printf '%d step(s) to take. Nothing was changed. Re-run with --apply.\n' "$planned"
+    fi
+    [[ $problems -gt 0 ]] && printf '%d thing(s) need your attention first (above).\n' "$problems"
+    exit 0
+fi
+if [[ $problems -gt 0 ]]; then
+    printf '%d problem(s) above. Fix them and run this again — it is idempotent.\n' "$problems"
+    exit 1
+fi
+printf 'Done. `hermes vpn doctor` is the one command to come back to.\n'

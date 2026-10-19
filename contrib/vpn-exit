@@ -1,0 +1,516 @@
+#!/bin/bash
+# Create and remove gluetun exits without handing the VPN credentials to the caller.
+#
+# Owned by root, executable through a narrow sudo rule, so an agent can ask for
+# a country without being able to read the key that gets it there. On a host
+# where the caller is in the docker group that separation is hygiene rather
+# than a wall -- docker group membership is already root-equivalent -- but it
+# keeps the credentials out of everyday reach and out of mistakes.
+#
+#   vpn-exit up <place> [--city]   start an exit for a country (or city)
+#   vpn-exit down <name>           stop and remove one
+#   vpn-exit list                  what is running
+#   vpn-exit providers             which VPNs have credentials here
+#   vpn-exit set-credentials <p>   store a provider's credentials (person, at a terminal)
+#   vpn-exit country <exit> [profile]   point a relay at an exit
+#   vpn-exit harden-browser        install the browser-wide WebRTC policy
+#   vpn-exit unharden-browser      remove it
+#
+# Install:
+#   install -m 750 -o root -g root vpn-exit /usr/local/sbin/vpn-exit
+#   echo 'hermes ALL=(root) NOPASSWD: /usr/local/sbin/vpn-exit' \
+#     > /etc/sudoers.d/vpn-exit && chmod 440 /etc/sudoers.d/vpn-exit
+
+set -euo pipefail
+
+ENV_DIR=${VPN_EXIT_ENV_DIR:-/root/vpn-exits}
+# One file per provider: `.env` is the default one, `mullvad.env` is picked by
+# `--provider mullvad`. Each holds whatever that provider needs -- gluetun's own
+# variable names, straight from its wiki -- and is readable by root only.
+ENV_FILE=${VPN_EXIT_ENV:-$ENV_DIR/.env}
+IMAGE=${VPN_EXIT_IMAGE:-qmcgaw/gluetun:latest}
+PORT_FIRST=${VPN_EXIT_PORT_FIRST:-8891}
+PORT_LAST=${VPN_EXIT_PORT_LAST:-8920}
+READY_TIMEOUT=${VPN_EXIT_READY_TIMEOUT:-75}
+LABEL=managed-by=vpn-exit
+
+die() { echo "vpn-exit: $*" >&2; exit 1; }
+
+# The caller names a place, nothing else: everything that reaches docker is
+# either validated here or a constant.
+clean_place() {
+    local place=$1
+    [[ $place =~ ^[A-Za-z][A-Za-z\ .\'-]{1,40}$ ]] || die "not a place name: '$place'"
+    echo "$place"
+}
+
+slug() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//'
+}
+
+free_port() {
+    local used port
+    used=$(docker ps --format '{{.Ports}}' | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 || true)
+    for ((port = PORT_FIRST; port <= PORT_LAST; port++)); do
+        if ! grep -qx "$port" <<< "$used"; then
+            echo "$port"
+            return 0
+        fi
+    done
+    die "no free port between $PORT_FIRST and $PORT_LAST"
+}
+
+# Whether a place is a country or a city is gluetun's business, not the
+# caller's: asking for "Miami" as a country fails, and expecting whoever calls
+# this to know the difference is a bug waiting to happen. Country first,
+# because most requests are countries, then city.
+# A secret belongs in a file, not in the environment. gluetun reads any of
+# these from a path given as <NAME>_SECRETFILE, and that is the whole fix: an
+# environment variable is printed by `docker inspect`, which is an ordinary
+# metadata read available to anyone in the docker group -- and this plugin
+# itself inspects exit containers twice on its normal path, so the key was
+# transiting the agent's own process to read a country name. The earlier
+# comment here reasoned about `ps` output and was right about `ps`; it just
+# moved the exposure somewhere nobody re-checked.
+is_secret() {
+    case $1 in
+        WIREGUARD_PRIVATE_KEY|WIREGUARD_PRESHARED_KEY|WIREGUARD_ADDRESSES) return 0 ;;
+        OPENVPN_USER|OPENVPN_PASSWORD|OPENVPN_KEY|OPENVPN_CERT) return 0 ;;
+        OPENVPN_ENCRYPTED_KEY|OPENVPN_KEY_PASSPHRASE) return 0 ;;
+        HTTPPROXY_USER|HTTPPROXY_PASSWORD|SHADOWSOCKS_PASSWORD) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+#: One user-defined network that every exit joins, so a relay can address them
+#: by name. Hardcoded, not an environment override: this script runs through an
+#: exact-path sudo rule with no SETENV, and each override is one more root
+#: primitive that only that rule is holding shut.
+EXITS_NET=hermes-exits
+
+ensure_exits_net() {
+    docker network inspect "$EXITS_NET" >/dev/null 2>&1 && return 0
+    docker network create "$EXITS_NET" >/dev/null || die "could not create network $EXITS_NET"
+    echo "created network $EXITS_NET (the exits and the relays share it)" >&2
+}
+
+start_attempt() {
+    local name=$1 port=$2 var=$3 place=$4 waited=0 creds secrets line key value
+
+    # Secrets to files, everything else to a filtered env-file. Not configurable
+    # by an environment variable on purpose: the sudo rule is exact-path with no
+    # SETENV, and every VPN_EXIT_* override is one more root-write primitive
+    # that only that rule is holding shut.
+    secrets="$ENV_DIR/secrets/$name"
+    rm -rf "$secrets"
+    mkdir -p "$secrets" || die "could not create $secrets"
+    chmod 700 "$secrets"
+    creds=$(mktemp "$ENV_DIR/.creds.XXXXXX")
+    chmod 600 "$creds"
+    while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
+        # A value may be quoted in the file; docker's env-file would keep the
+        # quotes, and so would a secret file.
+        value=${value%\"}; value=${value#\"}
+        value=${value%\'}; value=${value#\'}
+        if is_secret "$key"; then
+            # No trailing newline: gluetun trims, but a file that is exactly
+            # the secret cannot be read wrong by anything else either.
+            printf '%s' "$value" > "$secrets/$key"
+            chmod 600 "$secrets/$key"
+            printf '%s_SECRETFILE=/run/secrets/%s\n' "$key" "$key" >> "$creds"
+        else
+            printf '%s\n' "$line" >> "$creds"
+        fi
+    done < <(grep -E '^(VPN_|WIREGUARD_|OPENVPN_|SERVER_|HTTPPROXY_|SHADOWSOCKS_)[A-Z0-9_]+=' "$ENV_FILE")
+
+    ensure_exits_net
+    docker run -d \
+        --name "$name" \
+        --label "$LABEL" \
+        --network "$EXITS_NET" \
+        --cap-add NET_ADMIN \
+        --device /dev/net/tun:/dev/net/tun \
+        --env-file "$creds" \
+        -v "$secrets:/run/secrets:ro" \
+        -e "$var=$place" \
+        -e HTTPPROXY=on \
+        -e HTTPPROXY_LISTENING_ADDRESS=:8888 \
+        -p "127.0.0.1:$port:8888" \
+        --restart unless-stopped \
+        "$IMAGE" >/dev/null
+    # Removed here, on both paths out of this function, and not in a RETURN
+    # trap: bash runs a RETURN trap on *every* function return in the shell,
+    # not only the one that set it, so the trap fired later with $creds out of
+    # scope and `set -u` killed the run after the exit was already up.
+    rm -f "$creds"
+
+    while ((waited < READY_TIMEOUT)); do
+        # Process substitution: a gluetun looping on bad credentials is exactly
+        # the case whose log outgrows the pipe buffer, and then `grep -q` under
+        # pipefail reports failure after a match -- turning a two-second
+        # diagnosis into the full timeout.
+        if grep -q "Public IP address is" < <(docker logs "$name" 2>&1); then
+            docker logs "$name" 2>&1 | grep "Public IP address is" | tail -1 \
+                | sed "s/.*Public IP address is /$name ready: /"
+            return 0
+        fi
+        # A rejected place or bad credentials will never recover, and gluetun
+        # restarts forever rather than exiting: say so now instead of in 75s.
+        if grep -qiE "not valid|no server found|AUTH_FAILED|ERROR VPN settings" \
+             < <(docker logs "$name" 2>&1); then
+            break
+        fi
+        sleep 2
+        ((waited += 2))
+    done
+
+    # Leaving a broken container behind would block the next attempt, which
+    # would then quietly "start" the broken one.
+    LAST_ERROR=$(docker logs "$name" 2>&1 | grep -iE "not valid|no server found|AUTH_FAILED|ERROR" | tail -1 | cut -c1-200)
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rm -rf "$secrets"
+    return 1
+}
+
+cmd_up() {
+    local place kind name port
+    place=$(clean_place "${1:-}")
+    kind=${2:-auto}
+    if [[ -n ${PROVIDER_ARG:-} ]]; then
+        name="exit-$(slug "$PROVIDER_ARG")-$(slug "$place")"
+    else
+        name="exit-$(slug "$place")"
+    fi
+    [[ -r $ENV_FILE ]] || die "no credentials at $ENV_FILE — see \`hermes vpn provider <name>\` for what that provider needs"
+    grep -q "^VPN_SERVICE_PROVIDER=" "$ENV_FILE" \
+        || die "$ENV_FILE declares no VPN_SERVICE_PROVIDER"
+
+    # Process substitution, like the rest: a pipe into `grep -q` under
+    # pipefail reports failure after a match once more than 64 KiB follows it,
+    # which on a host with hundreds of containers is reachable.
+    if grep -qx "$name" < <(docker ps -a --format '{{.Names}}'); then
+        docker start "$name" >/dev/null
+        echo "$name already existed; started it"
+        return 0
+    fi
+
+    port=$(free_port)
+    case $kind in
+        city)    start_attempt "$name" "$port" SERVER_CITIES "$place" && return 0 ;;
+        country) start_attempt "$name" "$port" SERVER_COUNTRIES "$place" && return 0 ;;
+        *)
+            start_attempt "$name" "$port" SERVER_COUNTRIES "$place" && return 0
+            start_attempt "$name" "$port" SERVER_CITIES "$place" && return 0
+            ;;
+    esac
+    die "no exit for '$place': ${LAST_ERROR:-the tunnel did not come up}"
+}
+
+cmd_down() {
+    local name=${1:-}
+    # 80, not 40: `up` builds `exit-<provider>-<place>` and a long city name
+    # made a tunnel this could not close -- left running, and its secrets
+    # directory never cleaned up, because the rm below sits after this line.
+    [[ $name =~ ^exit-[a-z0-9-]{1,80}$ ]] || die "not an exit name: '$name'"
+    [[ $(docker inspect -f "{{index .Config.Labels \"managed-by\"}}" "$name" 2>/dev/null) == vpn-exit ]] \
+        || die "$name was not created by vpn-exit; refusing to touch it"
+    docker rm -f "$name" >/dev/null
+    # The secrets went with the container; they must go with its removal too,
+    # or every exit ever started leaves its key behind in a directory nobody
+    # lists.
+    rm -rf "$ENV_DIR/secrets/$name"
+    echo "$name removed"
+}
+
+# Chrome for Testing reads managed policy from this exact path. Not
+# /etc/opt/chrome, not /etc/opt/chrome-for-testing, not /etc/chromium -- those
+# are silently ignored, and so is the legacy policy name WebRtcIPHandlingPolicy.
+CHROME_POLICY_DIR=${VPN_EXIT_POLICY_DIR:-/etc/opt/chrome_for_testing/policies/managed}
+CHROME_POLICY_FILE="$CHROME_POLICY_DIR/hermes-vpn-webrtc.json"
+
+cmd_harden_browser() {
+    mkdir -p "$CHROME_POLICY_DIR"
+    printf '%s\n' '{"WebRtcIPHandling": "disable_non_proxied_udp"}' > "$CHROME_POLICY_FILE"
+    chmod 644 "$CHROME_POLICY_FILE"
+    echo "policy written: $CHROME_POLICY_FILE"
+    echo "WebRTC can no longer open a socket the exit does not cover, whatever arguments the browser is launched with."
+}
+
+cmd_unharden_browser() {
+    rm -f "$CHROME_POLICY_FILE"
+    rmdir -p "$CHROME_POLICY_DIR" 2>/dev/null || true
+    echo "policy removed: $CHROME_POLICY_FILE"
+}
+
+RELAY_UPSTREAM=${VPN_EXIT_RELAY_UPSTREAM:-/root/vpn-relay/upstream/upstream}
+
+# Point the relay at one exit. The address depends on where the relay can reach
+# it: containers sharing a user-defined network answer to their name, while the
+# default bridge has no embedded DNS and needs the IP. Resolve it here, at
+# switch time, rather than writing it down anywhere.
+# Is this container actually one of our exits? The power we hand out is "name a
+# country", and without this check that same power repoints a sealed sandbox's
+# only way out at ANY container on the host, including a plain proxy that
+# egresses directly, or the relay itself, which loops it into itself until its
+# threads and descriptors run out and both sandboxes lose egress.
+is_an_exit() {
+    local name=$1 image
+    [[ $(docker inspect "$name" -f '{{index .Config.Labels "managed-by"}}' 2>/dev/null) == vpn-exit ]] \
+        && return 0
+    image=$(docker inspect "$name" -f '{{.Config.Image}}' 2>/dev/null)
+    [[ $image == qmcgaw/gluetun* ]]
+}
+
+cmd_country() {
+    local name=$1 profile=${2:-} net addr ip upstream relay
+    # 127, not 60: an exit name runs to `exit-` + a 31-char provider + `-` +
+    # a 41-char place = 78, and the shorter cap refused a container that `up`
+    # had just minted and `down` would accept.
+    [[ $name =~ ^[A-Za-z0-9_.-]{1,127}$ ]] || die "not a container name: '$name'"
+    if [[ -n $profile ]]; then
+        [[ $profile =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "not a profile name: '$profile'"
+        upstream="$(dirname "$RELAY_UPSTREAM")/$profile"
+        relay="vpn-relay-$profile"
+        [[ -f $upstream ]] || die "profile '$profile' has no relay yet: vpn-relay-setup $profile"
+    else
+        # No profile named: the one shared relay, which is what a single-bot
+        # host has. Per profile is what keeps one bot's country change from
+        # moving another bot.
+        upstream="$RELAY_UPSTREAM"
+        relay="vpn-relay"
+    fi
+    [[ -w $(dirname "$upstream") ]] || die "no relay at $upstream"
+    docker inspect "$name" >/dev/null 2>&1 || die "no such exit: $name"
+    is_an_exit "$name" \
+        || die "$name is not a gluetun exit and was not created by vpn-exit; refusing to send a sandbox through it"
+    docker inspect "$relay" >/dev/null 2>&1 || die "no relay container $relay"
+
+    for net in $(docker inspect "$name" -f "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}"); do
+        # Process substitution for the same reason as elsewhere: a pipe into
+        # `grep -q` under `set -o pipefail` can report failure after a match,
+        # and here we would quietly fall back to a bridge address.
+        # -qxF, not -qw: `-w` treats `-` as a word boundary and reads the name
+        # as a regex, so `hermes-vpn` matches `hermes-vpn-lab`. One name per
+        # line, fixed string, whole line.
+        if [[ $net != bridge ]] && grep -qxF "$net" < <(docker inspect "$relay" \
+             -f "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}}{{\"\\n\"}}{{end}}"); then
+            addr="$name:8888"
+            break
+        fi
+    done
+    if [[ -z ${addr:-} ]]; then
+        # By name on a shared network when there is one, because a bridge IP is
+        # assigned by start order: pinning one means that after a restart the
+        # address can belong to a different container, and the sandbox's
+        # traffic leaves through whatever took it.
+        # `with index`, not a bare field path: for a container that is not on
+        # the default bridge, Go templates print the literal string
+        # `<no value>`, so the guard below never fired, the diagnostic never
+        # printed, and the caller was handed `<no value>:8888` as an address.
+        ip=$(docker inspect "$name" \
+            -f '{{with index .NetworkSettings.Networks "bridge"}}{{.IPAddress}}{{end}}')
+        [[ -n $ip && $ip != "<no value>" ]] \
+            || die "cannot work out how $relay reaches $name: they share no network. Put them on one: docker network connect $EXITS_NET $name"
+        addr="$ip:8888"
+        echo "note: reaching $name by bridge address $ip, which start order can reassign;" \
+             "put it and $relay on one network to address it by name" >&2
+    fi
+    [[ $addr =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ || $addr =~ ^[0-9.]+:[0-9]{1,5}$ ]] \
+        || die "refusing to write '$addr' as an upstream"
+
+    # Check reachability before writing. Write first and a failure leaves the
+    # sandbox pointing at something it cannot reach, with no egress at all and
+    # the working value already gone. An exit left on the default bridge is
+    # exactly that case: the relay is deliberately not on the bridge.
+    if ! docker exec "$relay" python3 -c "
+import socket, sys
+host, _, port = sys.argv[1].rpartition(':')
+s = socket.socket(); s.settimeout(5)
+try:
+    s.connect((host, int(port)))
+except OSError as exc:
+    sys.exit(str(exc))
+finally:
+    s.close()
+" "$addr" 2>/dev/null; then
+        die "$relay cannot reach $addr, so the upstream was left as it is. Put $name and \
+$relay on one network: docker network connect $EXITS_NET $name"
+    fi
+
+    printf '%s\n' "$addr" > "$upstream"
+    echo "relay upstream${profile:+ for $profile}: $addr"
+}
+
+cmd_list() {
+    docker ps --filter "label=$LABEL" --format '{{.Names}}\t{{.Ports}}\t{{.Status}}'
+}
+
+# Which VPNs this host actually has credentials for -- the agent can ask without
+# being able to read any of them.
+cmd_providers() {
+    local file name
+    shopt -s nullglob
+    for file in "$ENV_DIR"/.env "$ENV_DIR"/*.env; do
+        [[ -r $file ]] || continue
+        name=$( { grep -m1 "^VPN_SERVICE_PROVIDER=" "$file" | cut -d= -f2- | tr -d "\"'"  || true; } )
+        [[ -n $name ]] && echo "$name	$(basename "$file")"
+    done | sort -u
+}
+
+# One value out of pasted text: a gluetun KEY=VALUE line if there is one, else
+# the matching "Name = value" line of a WireGuard .conf. One layer of quotes and
+# the surrounding spaces come off. Empty when neither is present.
+_field() {
+    local text=$1 envkey=$2 confkey=$3 line value
+    line=$(grep -iE "^[[:space:]]*$envkey=" <<<"$text" | head -n1 || true)
+    if [[ -z $line ]]; then
+        line=$(grep -iE "^[[:space:]]*$confkey[[:space:]]*=" <<<"$text" | head -n1 || true)
+    fi
+    [[ -n $line ]] || return 0
+    value=${line#*=}
+    value=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$value")
+    value=${value%\"}; value=${value#\"}
+    value=${value%\'}; value=${value#\'}
+    printf '%s' "$value"
+}
+
+# Store one provider's credentials in its root-only file, typed by a person at
+# the terminal. The agent cannot reach this: it calls the helper with the output
+# captured, so there is no terminal, and without one this refuses before asking
+# for anything. A person pastes the provider's WireGuard config (or gluetun's
+# own VPN_*/WIREGUARD_* lines) and no value is ever echoed back.
+cmd_set_credentials() {
+    local provider=$1 provider_re='^[a-z][a-z0-9-]{1,30}$'
+    [[ $provider =~ $provider_re ]] || die "not a provider name: '$provider'"
+    [[ -t 0 ]] || die "set-credentials only runs at an interactive terminal, so a person enters the secret; the agent cannot"
+    [[ $EUID -eq 0 ]] || die "set-credentials writes a root-only file; run it through sudo"
+
+    local target="$ENV_DIR/$provider.env"
+    mkdir -p "$ENV_DIR"; chmod 700 "$ENV_DIR"
+    if [[ -e $target ]]; then
+        local yn
+        read -r -p "overwrite the existing credentials for $provider? [y/N] " yn </dev/tty
+        [[ $yn == [yY]* ]] || die "left $target unchanged"
+    fi
+
+    echo "Paste $provider's WireGuard config (from its config generator)," >&2
+    echo "or gluetun VPN_*/WIREGUARD_* lines. End with Ctrl-D:" >&2
+    local input; input=$(cat)
+    [[ -n ${input//[[:space:]]/} ]] || die "nothing was pasted"
+
+    local priv addr psk
+    priv=$(_field "$input" WIREGUARD_PRIVATE_KEY PrivateKey)
+    addr=$(_field "$input" WIREGUARD_ADDRESSES Address)
+    psk=$(_field "$input" WIREGUARD_PRESHARED_KEY PresharedKey)
+    [[ -n $priv && -n $addr ]] \
+        || die "could not find a WireGuard private key and address in what you pasted"
+
+    # gluetun on a host without IPv6 fails on an IPv6 tunnel address, and the
+    # config generators hand out both. Keep the IPv4 entries.
+    local ipv4; ipv4=$(tr ',' '\n' <<<"$addr" | sed 's/[[:blank:]]//g' | grep -v ':' | paste -sd, - || true)
+    [[ -n $ipv4 ]] && addr=$ipv4
+
+    local tmp; tmp=$(mktemp "$ENV_DIR/.set.XXXXXX"); chmod 600 "$tmp"
+    {
+        echo "VPN_SERVICE_PROVIDER=$provider"
+        echo "VPN_TYPE=wireguard"
+        echo "WIREGUARD_PRIVATE_KEY=$priv"
+        echo "WIREGUARD_ADDRESSES=$addr"
+        [[ -n $psk ]] && echo "WIREGUARD_PRESHARED_KEY=$psk"
+    } > "$tmp"
+    chown root:root "$tmp"
+    mv -f "$tmp" "$target"
+    chmod 600 "$target"
+
+    # Names only, never the values.
+    local wrote="VPN_SERVICE_PROVIDER, VPN_TYPE, WIREGUARD_PRIVATE_KEY, WIREGUARD_ADDRESSES"
+    [[ -n $psk ]] && wrote="$wrote, WIREGUARD_PRESHARED_KEY"
+    echo "wrote $target (root only) with: $wrote"
+    echo "now open an exit with: hermes vpn open <place> --provider $provider"
+}
+
+PROVIDER_ARG=""
+CITY=no
+ARGS=()
+while (($#)); do
+    case $1 in
+        --provider)
+            PROVIDER_ARG=${2:-}
+            # Quoted, because an unquoted pattern with a space breaks [[ =~ ]].
+            provider_re='^[a-z][a-z0-9-]{1,30}$'
+            [[ $PROVIDER_ARG =~ $provider_re ]] || die "not a provider name: '$PROVIDER_ARG'"
+            ENV_FILE="$ENV_DIR/$PROVIDER_ARG.env"
+            shift 2
+            ;;
+        --city) CITY=yes; shift ;;
+        # An unknown option is refused, not collected. Collected, it became a
+        # positional argument, and the second positional of `up` is the kind of
+        # lookup to attempt.
+        -*) die "unknown option: '$1'" ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+if ((${#ARGS[@]})); then set -- "${ARGS[@]}"; else set --; fi
+
+# Every override below is a path, an image or a number that reaches docker or
+# the filesystem as root. sudo's env_reset is what keeps the agent from setting
+# one; this is what keeps a sudoers rule written with SETENV -- which
+# contrib/install refuses to write and warns about -- from turning one into a
+# root read or write anywhere on this host.
+inside() {
+    local what=$1 path=$2
+    [[ $path == /* ]] || die "$what must be an absolute path: '$path'"
+    [[ $path != *..* ]] || die "$what must not contain '..': '$path'"
+    case $path in
+        /root|/root/*|/etc/opt/*|/tmp/*|/var/tmp/*) ;;
+        *) die "$what is outside the directories this helper may touch: '$path'" ;;
+    esac
+}
+inside VPN_EXIT_ENV_DIR "$ENV_DIR"
+inside VPN_EXIT_ENV "$ENV_FILE"
+inside VPN_EXIT_POLICY_DIR "$CHROME_POLICY_DIR"
+# This one was missing while the comment above claimed every path override was
+# covered. It is written to as root in cmd_country, so with a SETENV rule it
+# truncated any file on the host and put one line in it.
+inside VPN_EXIT_RELAY_UPSTREAM "$RELAY_UPSTREAM"
+image_re='^[a-z0-9][a-z0-9._/-]{1,100}(:[a-zA-Z0-9._-]{1,40})?$'
+[[ $IMAGE =~ $image_re ]] || die "not an image name: '$IMAGE'"
+for var in PORT_FIRST PORT_LAST READY_TIMEOUT; do
+    [[ ${!var} =~ ^[0-9]{1,5}$ ]] || die "VPN_EXIT_$var must be a number: '${!var}'"
+done
+((PORT_FIRST >= 1024 && PORT_LAST <= 65535 && PORT_FIRST <= PORT_LAST)) \
+    || die "VPN_EXIT_PORT_FIRST/LAST must be an ascending unprivileged range"
+
+# How many words each verb takes. Anything else is refused, so an extra word
+# cannot reach a command and change what it does: `up <place> <anything>` used
+# to read that second word as the kind of lookup to run.
+arity() {
+    local verb=$1 got=$2 lo=$3 hi=$4
+    ((got >= lo)) || die "$verb needs $lo argument(s), got $got"
+    ((got <= hi)) || die "$verb takes at most $hi argument(s), got $got"
+}
+
+verb=${1:-}
+if (($#)); then shift; fi
+case $verb in
+    up)
+        arity up $# 1 1
+        # An if, not `&& ... || ...`: a failed city attempt must not fall
+        # through and start a country-wide exit instead.
+        if [[ $CITY == yes ]]; then
+            cmd_up "$1" city
+        else
+            cmd_up "$1" auto   # country first, then city: see start_attempt
+        fi
+        ;;
+    down)             arity down $# 1 1;             cmd_down "$1" ;;
+    list)             arity list $# 0 0;             cmd_list ;;
+    providers)        arity providers $# 0 0;        cmd_providers ;;
+    set-credentials)  arity set-credentials $# 1 1;  cmd_set_credentials "$1" ;;
+    country)          arity country $# 1 2;          cmd_country "$1" "${2:-}" ;;
+    harden-browser)   arity harden-browser $# 0 0;   cmd_harden_browser ;;
+    unharden-browser) arity unharden-browser $# 0 0; cmd_unharden_browser ;;
+    *)    die "usage: vpn-exit up <place> [--city] [--provider <name>] | down <name> | list | providers | set-credentials <name> | country <exit> [profile] | harden-browser | unharden-browser" ;;
+esac

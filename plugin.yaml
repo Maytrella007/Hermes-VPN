@@ -1,0 +1,73 @@
+name: hermes-vpn
+version: 0.2.0
+description: >
+  Named network exits for the agent's browser. Ask it to browse from another
+  country and it switches, verifies the exit by reading back the address the far
+  end actually saw, and closes the running browser so the next page loads
+  through it. An exit is just a local proxy, so any VPN or tunnel works —
+  gluetun containers are discovered automatically, and one can be brought up on
+  demand for a place that has none through a root-owned helper, so the agent
+  names a country without ever handling the VPN credentials. No tunnels are
+  implemented here and no dependencies are added; the plugin is the part that was missing,
+  an agent that can pick an exit and knows which one it really got.
+author: William Wilamo
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - net_exits
+  - net_use
+  - net_where
+  - net_harden
+  - net_places
+  - net_lock
+  - net_failover
+  - net_tor_connect
+  - net_new_circuit
+  - net_doctor
+  - net_providers
+  - net_provider_setup
+  - net_add_provider
+  - net_open
+  - net_close
+provides_middleware:
+  - tool_execution
+provides_cli:
+  - vpn
+optional_env:
+  - name: NET_EXITS_HELPER
+    description: "Root-owned helper that creates and removes exits, run through a sudoers rule (default: /usr/local/sbin/vpn-exit). See contrib/vpn-exit."
+    prompt: "Exit helper path"
+    password: false
+  - name: NET_EXITS_FILE
+    description: "JSON file listing exits that are not gluetun containers (default: ~/.hermes/net-exits.json)"
+    prompt: "Exits file"
+    password: false
+  - name: NET_EXITS_STATE_FILE
+    description: "Where the selected exit is remembered across restarts (default: ~/.hermes/net-exits-state.json)"
+    prompt: "State file"
+    password: false
+  - name: NET_EXITS_VERIFY
+    description: "Script that confirms, from inside a sandbox, where it really comes out (default: /usr/local/bin/vpn-verify). See contrib/vpn-verify."
+    prompt: "Sandbox verifier path"
+    password: false
+  - name: NET_EXITS_SANDBOX_PROXY
+    description: "The proxy a sandboxed browser is pointed at, in its managed Chrome policy (default: http://vpn-exit:8888, the per-profile relay's alias)."
+    prompt: "Sandbox proxy"
+    password: false
+  - name: NET_EXITS_CHROME_POLICY
+    description: "Managed-policy file for the WebRTC setting (default: /etc/opt/chrome_for_testing/policies/managed/hermes-vpn-webrtc.json). The directory matters more than the name: Chrome merges every file in it, and reads only this path."
+    prompt: "Chrome policy file"
+    password: false
+  - name: NET_EXITS_FAILOVER
+    description: "Arms failover when the state file says nothing about it: a browser call whose exit has died moves to the standby exit you named, and nowhere else. Off by default, and it only fires while the kill switch is armed."
+    prompt: "Automatic failover armed at start"
+    password: false
+  - name: NET_EXITS_LOCKED
+    description: "Arms the kill switch when the state file says nothing about it. The state file wins, so this is a starting position, not a floor."
+    prompt: "Kill switch armed at start"
+    password: false
+  - name: NET_EXITS_PROFILE
+    description: "Overrides which Hermes profile this agent believes it is running as. For testing: getting it wrong makes the plugin act on the wrong browser."
+    prompt: "Profile name override"
+    password: false

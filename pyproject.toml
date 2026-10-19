@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-vpn"
+version = "0.2.0"
+description = "Named network exits for a Hermes Agent's browser: pick a country, and prove which one it actually got."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "William Wilamo" }]
+keywords = ["hermes-agent", "plugin", "vpn", "proxy", "gluetun", "tor"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Maytrella007/Hermes-VPN"
+
+# The plugin is loaded by Hermes from plugin.yaml + __init__.py; netexits is the
+# one importable module. Listing it explicitly keeps a stray build from trying to
+# auto-discover __init__.py as a package.
+[tool.setuptools]
+py-modules = ["netexits"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

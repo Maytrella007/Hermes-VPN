@@ -1,0 +1,21 @@
+# The whole privilege this plugin asks of your host.
+#
+# Installed by `contrib/install --apply` as /etc/sudoers.d/vpn-exit, mode 440,
+# with @AGENT_USER@ replaced by the account the agent runs as. Read it before
+# you let anything install it: these two lines are the entire grant.
+#
+# One account, one absolute path, no arguments listed, no environment passed.
+# Without SETENV, sudo resets the environment, which is what keeps the agent
+# from reaching the helper's VPN_EXIT_* overrides; the helper now also refuses
+# any of them that points outside /root, /etc/opt and /tmp.
+#
+# What that path accepts is a fixed set of verbs with a fixed number of words:
+#   up <place> [--city] [--provider <name>] | down <exit-name> | list
+#   providers | country <exit> [profile] | harden-browser | unharden-browser
+# Anything else, including an extra word, is refused before it does anything.
+#
+# There is one more verb, set-credentials <name>, which writes a provider's
+# root-only env file. It is for a person at the host, not the agent: it refuses
+# unless stdin is an interactive terminal, and the agent only ever reaches the
+# helper with its output captured, so it has no terminal to offer.
+@AGENT_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/vpn-exit

@@ -1,0 +1,76 @@
+#!/bin/bash
+# /usr/local/sbin/vpn-profile-network <profile> [--hermes-home DIR]
+#
+# Makes FUTURE sandboxes of one profile be born on that profile's sealed
+# network, by setting `docker_extra_args` in its config.yaml.
+#
+# This is the half that `vpn-migrate` cannot do. Migrating moves the container
+# that is running now; this decides what happens the next time Hermes creates
+# one -- and it does create one, after an image change or a `docker rm`. Without
+# this, a recreated sandbox comes up on the default bridge with no relay, so it
+# has a way out that is not the tunnel and no proxy pointing it anywhere.
+#
+# Safe to run while Hermes is running: `docker_extra_args` is NOT part of the
+# container-reuse fingerprint (which hashes image, mounts and home), so this
+# does not recreate the sandbox that was just migrated in place. The flip side
+# is the reason this script exists at all: because it is not in the
+# fingerprint, changing it has no effect until a container is created anyway.
+#
+# Idempotent, and it keeps a dated backup of every file it edits.
+set -uo pipefail
+
+PROFILE=${1:?usage: vpn-profile-network <profile> [--hermes-home DIR]}
+shift
+HOME_DIR=${HERMES_HOME_DIR:-/home/hermes/.hermes}
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        # Parsed, rather than read off $3: the flag was documented in the usage
+        # line and only worked in that exact three-word shape, so
+        # `vpn-profile-network lab /some/home` used the default in silence.
+        --hermes-home) HOME_DIR=${2:?--hermes-home needs a directory}; shift 2 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+NET="hermes-vpn-$PROFILE"
+CONFIG="$HOME_DIR/profiles/$PROFILE/config.yaml"
+
+say() { printf '  %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ $PROFILE =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "not a profile name: '$PROFILE'"
+[[ -f $CONFIG ]] || die "no config at $CONFIG"
+docker network inspect "$NET" >/dev/null 2>&1 || die "no network $NET: vpn-relay-setup $PROFILE"
+
+if grep -q -- "--network=$NET" "$CONFIG"; then
+    say "$PROFILE already points at $NET"
+    exit 0
+fi
+
+stamp=$(date +%Y%m%d-%H%M%S)
+cp -a "$CONFIG" "$CONFIG.bak-$stamp"
+
+if grep -qE '^\s*docker_extra_args:' "$CONFIG"; then
+    # Replace an existing --network=… in place; leave any other flag alone.
+    if grep -qE '^\s*-\s*"--network=' "$CONFIG"; then
+        sed -i -E "s|^(\s*-\s*)\"--network=[^\"]*\"(.*)$|\1\"--network=$NET\"\2|" "$CONFIG"
+        say "$PROFILE: pointed its existing --network at $NET (backup config.yaml.bak-$stamp)"
+    else
+        die "$CONFIG already has docker_extra_args without a --network; add \"--network=$NET\" by hand"
+    fi
+else
+    # Insert into the active `terminal:` block, right after its opening line.
+    python3 - "$CONFIG" "$NET" <<'PY' || die "could not edit $CONFIG"
+import re, sys
+path, net = sys.argv[1], sys.argv[2]
+text = open(path).read()
+match = re.search(r"^terminal:\n", text, re.M)
+if not match:
+    sys.exit("no active terminal: block")
+addition = f'  docker_extra_args:\n    - "--network={net}"   # sealed: no way out but the tunnel\n'
+open(path, "w").write(text[: match.end()] + addition + text[match.end() :])
+PY
+    say "$PROFILE: added docker_extra_args -> $NET (backup config.yaml.bak-$stamp)"
+fi
+
+grep -q -- "--network=$NET" "$CONFIG" || die "the edit did not take; $CONFIG.bak-$stamp has the original"
+say "verified in $CONFIG"

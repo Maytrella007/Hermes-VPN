@@ -1,0 +1,121 @@
+#!/bin/bash
+# /usr/local/bin/vpn-migrate <container> [profile] [--revert]
+#
+# Moves an ALREADY-RUNNING Hermes sandbox onto the hermetic VPN egress without
+# `docker rm`. Every process inside keeps running with the same PID: Xvnc, dbus,
+# the Xfce dock and any open browser all survive.
+#
+# Idempotent: safe to re-run; each step is skipped if already done.
+# Reversible: `--revert` puts the container back on the default bridge.
+#
+# ORDER MATTERS. Connect first, disconnect second: between the two the container
+# is dual-homed and never loses connectivity, and if the script dies in the
+# middle the container is still working (just not yet sealed) -- re-run to finish.
+set -uo pipefail
+
+SB=${1:?usage: vpn-migrate <container> [profile] [--revert]}
+# A profile names its own network and relay: one relay per bot is what keeps
+# one bot's country change from moving another's. Without it, the single
+# shared network, which is what a one-bot host has.
+PROFILE=""
+MODE=""
+for arg in "${2:-}" "${3:-}"; do
+    case "$arg" in
+        --revert) MODE=--revert ;;
+        "") ;;
+        *) PROFILE=$arg ;;
+    esac
+done
+NET=${VPN_NET:-hermes-vpn${PROFILE:+-$PROFILE}}
+PROXY=${VPN_PROXY:-http://vpn-exit:8888}
+POL=/etc/opt/chrome_for_testing/policies/managed
+
+say() { printf '  %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+on_net() {
+  # Process substitution, not a pipe: with `set -o pipefail`, `grep -q` exits
+  # at the first match while the writer is still writing, the writer takes
+  # SIGPIPE, and the pipeline reports failure despite the match. It depends on
+  # how much output there is, so it fails intermittently.
+  grep -qx "$1" < <(docker inspect "$SB" \
+    -f "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}" 2>/dev/null | tr ' ' '\n')
+}
+
+docker inspect "$SB" >/dev/null 2>&1 || die "container $SB not found"
+
+# ---------------------------------------------------------------- revert ------
+if [[ $MODE == "--revert" ]]; then
+  # The network to leave is read off the container, not taken from an optional
+  # argument. With the argument missing -- which is the form this script's own
+  # header documented -- NET was the pre-per-profile name, so revert reconnected
+  # the bridge, found that name not attached, never disconnected the sealed
+  # network the sandbox was actually on, deleted the proxy policy anyway, and
+  # printed "reverted". The result was a dual-homed sandbox with no proxy at
+  # all: browsing from this host's own address, reported as a success.
+  # Connect first, disconnect second -- the same order as the migration, and
+  # for the same reason: between the two the container is dual-homed and never
+  # loses connectivity. Disconnecting first and then failing to reconnect
+  # leaves it on no network at all.
+  on_net bridge || { docker network connect bridge "$SB" \
+    && say "reconnected bridge" || die "could not reconnect bridge; nothing was disconnected"; }
+  for attached in $(docker inspect "$SB" \
+      -f "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}"); do
+    [[ $attached == bridge ]] && continue
+    [[ $attached == hermes-vpn* ]] || continue
+    docker network disconnect "$attached" "$SB" && say "disconnected $attached"
+  done
+  docker exec -u root "$SB" rm -f "$POL/vpn.json" 2>/dev/null && say "removed Chrome policy"
+  docker exec -u root "$SB" rm -f /root/.curlrc /etc/pip.conf /etc/apt/apt.conf.d/99vpn 2>/dev/null
+  docker exec -u root "$SB" git config --global --unset http.proxy 2>/dev/null
+  say "reverted; the browser keeps the old policy for up to ~20 s"
+  exit 0
+fi
+
+[[ $(docker network inspect "$NET" -f '{{.Internal}}' 2>/dev/null) == "true" ]] \
+  || die "network $NET does not exist or is not --internal; bring up the relay stack first"
+
+# --- step 1: Chrome policy FIRST, while the container still has connectivity --
+# Both browsers (the Xfce dock Chrome and agent-browser) take their proxy from
+# this file alone -- no env var is needed, which is what makes a live migration
+# possible at all. Chrome re-reads managed policy on its own within ~10-20 s.
+docker exec -u root "$SB" mkdir -p "$POL" || die "could not create $POL"
+printf '%s\n' "{\"ProxyMode\":\"fixed_servers\",\"ProxyServer\":\"$PROXY\",\"ProxyBypassList\":\"\",\"WebRtcIPHandling\":\"disable_non_proxied_udp\",\"DnsOverHttpsMode\":\"off\"}" \
+  | docker exec -i -u root "$SB" tee "$POL/vpn.json" >/dev/null || die "could not write the policy"
+docker exec -u root "$SB" chmod 755 /etc/opt /etc/opt/chrome_for_testing \
+  /etc/opt/chrome_for_testing/policies "$POL"
+docker exec -u root "$SB" chmod 644 "$POL/vpn.json"
+say "step 1/4: Chrome policy written (dock browser + agent-browser)"
+
+# --- step 2: non-browser tooling, also file-based, also live-injectable -------
+docker exec -i -u root "$SB" sh -c "
+  printf 'proxy = $PROXY\n' > /root/.curlrc
+  printf '[global]\nproxy = $PROXY\n' > /etc/pip.conf
+  mkdir -p /etc/apt/apt.conf.d
+  printf 'Acquire::http::Proxy \"$PROXY\";\nAcquire::https::Proxy \"$PROXY\";\n' > /etc/apt/apt.conf.d/99vpn
+  git config --global http.proxy '$PROXY'
+  git config --global https.proxy '$PROXY'
+" || die "could not write the tooling proxy config"
+say "step 2/4: curl / pip / apt / git pointed at the proxy"
+
+# --- step 3: join the internal network (container becomes dual-homed) --------
+if on_net "$NET"; then
+  say "step 3/4: already on $NET"
+else
+  docker network connect "$NET" "$SB" || die "could not connect $NET"
+  say "step 3/4: connected to $NET"
+fi
+docker exec "$SB" getent hosts vpn-exit >/dev/null \
+  || die "vpn-exit does not resolve from $SB — is the relay on $NET with that alias?"
+docker exec "$SB" curl -sf --max-time 10 --proxy "$PROXY" https://1.1.1.1/cdn-cgi/trace >/dev/null \
+  || die "proxy $PROXY not reachable from $SB; NOT disconnecting bridge (container left working)"
+say "        proxy reachable through $NET"
+
+# --- step 4: seal it -- drop every other network ------------------------------
+for n in $(docker inspect "$SB" -f "{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}"); do
+  [[ $n == "$NET" ]] && continue
+  docker network disconnect "$n" "$SB" && say "step 4/4: disconnected $n"
+done
+
+printf '\nmigrated. verifying:\n'
+exec vpn-verify "$SB"

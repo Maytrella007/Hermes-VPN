@@ -1,0 +1,73 @@
+# NordVPN
+
+## TLDR
+
+```sh
+# OpenVPN
+docker run -it --rm --cap-add=NET_ADMIN --device /dev/net/tun \
+-e VPN_SERVICE_PROVIDER=nordvpn \
+-e OPENVPN_USER=abc -e OPENVPN_PASSWORD=abc \
+-e SERVER_COUNTRIES=Netherlands qmcgaw/gluetun
+```
+
+💁 Your credentials are NO LONGER your email+password, it is now your service credentials.
+
+[▶️ obtain your service credential](https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/service-credentials/)
+
+```sh
+# Wireguard
+docker run -it --rm --cap-add=NET_ADMIN --device /dev/net/tun \
+-e VPN_SERVICE_PROVIDER=nordvpn \
+-e VPN_TYPE=wireguard \
+-e WIREGUARD_PRIVATE_KEY=wOEI9rqqbDwnN8/Bpp22sVz48T71vJ4fYmFWujulwUU= \
+-e SERVER_COUNTRIES=Netherlands qmcgaw/gluetun
+```
+
+[▶️ obtain your Wireguard private key](#obtain-your-wireguard-private-key)
+
+```yml
+version: "3"
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=openvpn # or wireguard
+      - OPENVPN_USER=abc
+      - OPENVPN_PASSWORD=abc
+      - SERVER_COUNTRIES=Netherlands
+```
+
+## Required environment variables
+
+- `VPN_SERVICE_PROVIDER=nordvpn`
+
+### OpenVPN only
+
+- `OPENVPN_USER`
+- `OPENVPN_PASSWORD`
+
+### Wireguard only
+
+- `WIREGUARD_PRIVATE_KEY`
+
+## Optional environment variables
+
+- `SERVER_COUNTRIES`: Comma separated list of countries
+- `SERVER_REGIONS`: Comma separated list of regions
+- `SERVER_CITIES`: Comma separated list of server cities
+- `SERVER_HOSTNAMES`: Comma separated list of server hostnames. Beware this is the narrowest filter, so if you set this to a single hostname and this hostname disappears from the Gluetun servers data due to an update, your container will no longer work until this filter is changed. I would suggest avoiding it unless you know this reliability risk.
+- `SERVER_CATEGORIES`: Comma separated list of server categories
+- `OPENVPN_PROTOCOL`: `udp` or `tcp`, defaults to `udp`
+
+## Obtain your Wireguard private key
+
+Update 2023-09-24: you need to retrieve it from their web interface in manual setup section, see [this comment](https://github.com/qdm12/gluetun-wiki/issues/15).
+
+## Servers
+
+To see a list of servers available, [list the VPN servers with Gluetun](../servers.md#list-of-vpn-servers).
