@@ -164,20 +164,48 @@ class PortParsing(unittest.TestCase):
 
 
 class BrowserArguments(unittest.TestCase):
-    def test_base_arguments_are_kept(self) -> None:
-        """Setting the variable replaces Hermes's defaults, so they must be re-added."""
-        args = netexits.browser_args("http://127.0.0.1:8888")
-        for base in netexits.BASE_BROWSER_ARGS:
-            self.assertIn(base, args)
+    def setUp(self) -> None:
+        self._saved = os.environ.get(netexits.BROWSER_ARGS_ENV)
+        os.environ.pop(netexits.BROWSER_ARGS_ENV, None)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        if self._saved is None:
+            os.environ.pop(netexits.BROWSER_ARGS_ENV, None)
+        else:
+            os.environ[netexits.BROWSER_ARGS_ENV] = self._saved
+
+    def test_core_defaults_are_preserved_not_forced(self) -> None:
+        """Core owns the sandbox posture, so whatever it put in the variable is
+        kept and the plugin only appends its own flags."""
+        os.environ[netexits.BROWSER_ARGS_ENV] = "--no-sandbox,--disable-dev-shm-usage"
+        args = netexits.browser_args("http://127.0.0.1:8888").split(",")
+        self.assertIn("--no-sandbox", args)
+        self.assertIn("--disable-dev-shm-usage", args)
         self.assertIn("--proxy-server=http://127.0.0.1:8888", args)
+
+    def test_no_sandbox_is_never_forced(self) -> None:
+        """With an empty variable the plugin adds only its own flags; core adds
+        the sandbox bypass itself when it is needed."""
+        args = netexits.browser_args("http://127.0.0.1:8888").split(",")
+        self.assertNotIn("--no-sandbox", args)
+        self.assertEqual(args, ["--proxy-server=http://127.0.0.1:8888", netexits.WEBRTC_ARG])
+
+    def test_repeated_switches_do_not_pile_up(self) -> None:
+        """Each switch writes the variable back, so the next read must not
+        accumulate stale proxy or WebRTC flags."""
+        os.environ[netexits.BROWSER_ARGS_ENV] = netexits.browser_args("http://a:1")
+        os.environ[netexits.BROWSER_ARGS_ENV] = netexits.browser_args("http://b:2")
+        args = os.environ[netexits.BROWSER_ARGS_ENV].split(",")
+        self.assertEqual(args.count(netexits.WEBRTC_ARG), 1)
+        self.assertEqual(
+            [a for a in args if a.startswith("--proxy-server=")],
+            ["--proxy-server=http://b:2"],
+        )
 
     def test_comma_separated(self) -> None:
         """Hermes splits this variable on commas, so a space would break a flag."""
         self.assertNotIn(" ", netexits.browser_args("http://127.0.0.1:1"))
-        self.assertEqual(
-            len(netexits.browser_args("http://x:1").split(",")),
-            len(netexits.BASE_BROWSER_ARGS) + 2,  # proxy and the WebRTC policy
-        )
 
     def test_direct_has_no_proxy_argument(self) -> None:
         self.assertNotIn("--proxy-server", netexits.browser_args(""))
@@ -379,8 +407,6 @@ class Reporting(_Sandbox):
     def test_where_names_the_place_it_saw(self) -> None:
         self.seeing(ok=True, ip="201.0.0.5", country="MX", city="Mexico City")
         self.assertIn("Mexico City", netexits.describe_here())
-
-
 
 
 class LookupRobustness(unittest.TestCase):
@@ -826,11 +852,11 @@ class WebRTCLeak(unittest.TestCase):
     def test_nothing_to_protect_without_a_proxy(self) -> None:
         self.assertNotIn(netexits.WEBRTC_ARG, netexits.browser_args(""))
 
-    def test_the_base_arguments_still_survive(self) -> None:
+    def test_the_proxy_and_webrtc_flags_appear_together(self) -> None:
+        os.environ.pop(netexits.BROWSER_ARGS_ENV, None)
         args = netexits.browser_args(MX_PROXY).split(",")
-        for base in netexits.BASE_BROWSER_ARGS:
-            self.assertIn(base, args)
-        self.assertEqual(len(args), len(netexits.BASE_BROWSER_ARGS) + 2)
+        self.assertIn(f"--proxy-server={MX_PROXY}", args)
+        self.assertIn(netexits.WEBRTC_ARG, args)
 
 
 class Doctor(_Sandbox):
@@ -1340,8 +1366,6 @@ class ReportsFactsNotVerdicts(_Sandbox):
         self.seeing(ok=True, ip="1.2.3.4", country="DE", city="Frankfurt")
         answer = netexits.switch("exit-x")
         self.assertNotIn("labels", answer)
-
-
 
 
 class FailsClosed(_Sandbox):
@@ -1888,8 +1912,6 @@ class AWorkingTunnelThePluginCannotSee(_Sandbox):
         self.assertIn("docker group", report)
 
 
-
-
 class WhatTheVerifierIsAllowedToSay(unittest.TestCase):
     """How a confirmed sandbox sighting is read, and what must not reject one.
 
@@ -2005,6 +2027,7 @@ class TheCircuitIsConfirmedBeforeTheBrowserMoves(_Sandbox):
 
     def test_and_let_through_once_it_has(self) -> None:
         netexits.apply(self.tor)
+        Path(self._dir.name, "config.yaml").write_text("browser:\n  allow_private_urls: true\n")
         self.bootstrapped()
         self.answers()
         netexits.tor_connect(f"https://{self.ONION}/")
@@ -2016,6 +2039,7 @@ class TheCircuitIsConfirmedBeforeTheBrowserMoves(_Sandbox):
     def test_an_onion_through_a_vpn_exit_is_held_with_the_real_reason(self) -> None:
         """It would not resolve at all, and the browser would blame the site."""
         netexits.apply(self.mx)
+        Path(self._dir.name, "config.yaml").write_text("browser:\n  allow_private_urls: true\n")
         held = netexits.guard_browser("browser_navigate", {"url": f"http://{self.ONION}/"})
         self.assertIn("not going through Tor", held)
 
@@ -2154,23 +2178,6 @@ class WhatTheAuditFoundInTheSmallerPlaces(_Sandbox):
         with self.assertRaises(netexits.ExitError):
             netexits.check_proxy("http://127.0.0.1:8891\n")
 
-    def test_a_nested_browser_block_is_left_alone(self) -> None:
-        """A `browser:` under `agent:` is not the key the setting goes in."""
-        config = Path(self._dir.name) / "config.yaml"
-        config.write_text("agent:\n  browser:\n    inactivity_timeout: 120\n")
-        said = netexits._set_private_urls(True)
-        after = config.read_text()
-        self.assertIn("allow_private_urls: true", after, "a top-level block is appended")
-        self.assertIn("agent:\n  browser:\n", after, "and the nested one is untouched")
-        self.assertEqual(said, "")
-
-    def test_a_flow_mapping_is_reported_instead_of_rewritten(self) -> None:
-        config = Path(self._dir.name) / "config.yaml"
-        config.write_text("browser: {headless: true}\n")
-        said = netexits._set_private_urls(True)
-        self.assertIn("not a plain block", said)
-        self.assertEqual(config.read_text(), "browser: {headless: true}\n")
-
 
 class TheGuardReadsTheHostTheWayChromeDoes(_Sandbox):
     """The substitute for Hermes' SSRF check, while Tor mode has it off.
@@ -2248,18 +2255,18 @@ class TheGuardReadsTheHostTheWayChromeDoes(_Sandbox):
         self.assertEqual(netexits._private_destination(None), "")
 
 
-class TheGuardRunsWheneverHermesCheckIsOff(_Sandbox):
-    """It is not enough to run while the state says Tor mode is on.
+class TheGuardRunsWheneverPrivateUrlsAreAllowed(_Sandbox):
+    """The guard stands in for Hermes' refusal whenever that refusal is off.
 
-    The mode turns Hermes' refusal off by writing a marked line into the
-    config. Three paths leave that line while the state reads off: a sandbox
-    `net_use`, a `close_exit`, a state write that drops the key. In each,
-    Hermes is not refusing and nor would this if it keyed on the state alone.
+    Hermes' refusal of non-resolving addresses is off exactly when the profile
+    config allows private URLs -- a line a person sets, not this plugin. So the
+    substitute keys on the setting, not on the Tor-mode state: a path that
+    leaves the setting on while the state reads off still has to be guarded.
     """
 
-    def with_the_marker_but_the_mode_off(self) -> None:
+    def with_private_urls_allowed_but_the_mode_off(self) -> None:
         Path(self._dir.name, "config.yaml").write_text(
-            f"browser:\n  {netexits.PRIVATE_URLS_MARK}\n  allow_private_urls: true\n"
+            "browser:\n  allow_private_urls: true\n"
         )
         netexits._write_state(tor_mode={"on": False}, locked=True,
                               chosen={"name": "x", "proxy": "http://127.0.0.1:8891"})
@@ -2269,161 +2276,23 @@ class TheGuardRunsWheneverHermesCheckIsOff(_Sandbox):
         netexits._last_check = ("", 0.0, False)
 
     def test_an_internal_address_is_held_in_that_window(self) -> None:
-        self.with_the_marker_but_the_mode_off()
+        self.with_private_urls_allowed_but_the_mode_off()
         self.assertFalse(netexits.tor_mode(), "the state says off")
         self.assertTrue(netexits.guard_browser("browser_navigate", {"url": "http://127.0.0.1/"}))
 
     def test_a_public_one_is_not(self) -> None:
-        self.with_the_marker_but_the_mode_off()
+        self.with_private_urls_allowed_but_the_mode_off()
         self.assertEqual(netexits.guard_browser("browser_navigate",
                                                 {"url": "https://example.com/"}), "")
 
-    def test_a_setting_with_no_marker_does_not_turn_the_guard_on(self) -> None:
-        """Without the marker the line is the profile owner's, not ours, and
-        Hermes' own check is the one in force -- this does not second-guess it."""
+    def test_a_human_set_setting_turns_the_guard_on(self) -> None:
+        """Whoever set `allow_private_urls`, Hermes' own check is off, so this
+        one is in force -- it does not matter that the plugin did not write it."""
         Path(self._dir.name, "config.yaml").write_text(
             "browser:\n  allow_private_urls: true\n")
         netexits._write_state(tor_mode={"on": False}, locked=False)
-        self.assertEqual(netexits.guard_browser("browser_navigate",
-                                                {"url": "http://127.0.0.1/"}), "")
-
-
-class TheConfigSurgeryIsOnSomeoneElsesFile(_Sandbox):
-    """Entering Tor mode edits a file this plugin did not write.
-
-    So every shape here is one a real config.yaml can have, and the test is
-    whether the file still means what it meant. Nothing imports a YAML
-    parser: the suite has no dependencies, and the thing that decides
-    whether it parses is the indent, which is checked directly.
-    """
-
-    def config(self, body: str) -> Path:
-        path = Path(self._dir.name) / "config.yaml"
-        with path.open("w", newline="") as handle:
-            handle.write(body)
-        return path
-
-    def indent_of(self, line: str) -> str:
-        return line[:len(line) - len(line.lstrip())]
-
-    def test_a_four_space_block_is_written_at_four_spaces(self) -> None:
-        """Two spaces into a four-space block is a line less indented than
-        its siblings, and the file stops parsing from there on."""
-        path = self.config("browser:\n    headless: true\n")
-        self.assertEqual(netexits._set_private_urls(True), "")
-        lines = path.read_text().split("\n")
-        ours = next(line for line in lines if "allow_private_urls" in line)
-        sibling = next(line for line in lines if "headless" in line)
-        self.assertEqual(self.indent_of(ours), self.indent_of(sibling))
-        self.assertEqual(self.indent_of(ours), "    ")
-
-    def test_a_tab_indented_block_keeps_its_tabs(self) -> None:
-        path = self.config("browser:\n\theadless: true\n")
-        netexits._set_private_urls(True)
-        ours = next(l for l in path.read_text().split("\n") if "allow_private_urls" in l)
-        self.assertEqual(self.indent_of(ours), "\t")
-
-    def test_a_comment_after_the_key_is_still_a_block(self) -> None:
-        """It was read as a shape this could not edit, so the mode came up
-        with the setting never written and said nothing was wrong."""
-        path = self.config("browser:  # the bot's own browser\n  headless: true\n")
-        self.assertEqual(netexits._set_private_urls(True), "")
-        self.assertIn("allow_private_urls: true", path.read_text())
-
-    def test_crlf_line_endings_survive(self) -> None:
-        path = self.config("browser:\r\n  headless: true\r\n")
-        netexits._set_private_urls(True)
-        with path.open(newline="") as handle:
-            after = handle.read()
-        self.assertIn("allow_private_urls: true\r\n", after)
-        self.assertEqual(after.count("\r\n"), after.count("\n"), "no ending was left bare")
-
-    def test_a_line_separator_inside_a_scalar_is_not_a_line(self) -> None:
-        """`splitlines()` breaks on U+2028 and the value came back changed."""
-        path = self.config('browser:\n  note: "a b"\n')
-        netexits._set_private_urls(True)
-        self.assertIn('"a b"', path.read_text())
-
-    def test_two_browser_keys_are_refused_rather_than_half_edited(self) -> None:
-        """YAML keeps the last, so writing into the first sets nothing."""
-        body = "browser:\n  headless: true\nmodel: x\nbrowser:\n  other: 1\n"
-        path = self.config(body)
-        said = netexits._set_private_urls(True)
-        self.assertIn("opens `browser:` 2 times", said)
-        self.assertEqual(path.read_text(), body, "and it did not touch the file")
-
-    def test_the_backup_is_never_wider_than_the_original(self) -> None:
-        path = self.config("browser:\n  headless: true\n")
-        path.chmod(0o600)
-        netexits._set_private_urls(True)
-        backups = list(Path(self._dir.name).glob("config.yaml.bak-*"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
-
-    def test_our_pair_goes_out_again_without_a_word(self) -> None:
-        path = self.config("browser:\n  headless: true\n")
-        netexits._set_private_urls(True)
-        self.assertEqual(netexits._set_private_urls(False), "")
-        self.assertFalse(netexits.private_urls_allowed())
-        self.assertIn("headless: true", path.read_text())
-
-    def test_a_config_with_no_browser_key_gets_it_back_unchanged(self) -> None:
-        """The key is appended when there is none, and an empty one left
-        behind reads as None, which breaks a lookup of `browser.anything`."""
-        path = self.config("model: opus\n")
-        netexits._set_private_urls(True)
-        self.assertIn("browser:", path.read_text())
-        netexits._set_private_urls(False)
-        self.assertEqual(path.read_text(), "model: opus\n")
-
-    def test_a_browser_block_that_was_already_there_stays(self) -> None:
-        path = self.config("browser:\n  headless: true\n")
-        netexits._set_private_urls(True)
-        netexits._set_private_urls(False)
-        self.assertEqual(path.read_text(), "browser:\n  headless: true\n")
-
-    def test_a_reformatted_value_under_our_marker_is_still_ours(self) -> None:
-        self.config(f"browser:\n  {netexits.PRIVATE_URLS_MARK}\n  allow_private_urls: True\n")
-        self.assertEqual(netexits._set_private_urls(False), "")
-        self.assertFalse(netexits.private_urls_allowed())
-
-    def test_a_setting_that_outlived_its_marker_is_reported_not_passed_over(self) -> None:
-        """Any program that round-trips this YAML drops the comment. Keying
-        the removal on it meant the setting stayed on, `tor --off` reported
-        success, and `doctor` could no longer see it either."""
-        path = self.config("browser:\n  allow_private_urls: true\n")
-        said = netexits._set_private_urls(False)
-        self.assertIn("still says", said)
-        self.assertIn("allow_private_urls", said)
-        self.assertTrue(netexits.private_urls_allowed(), "and it is still on, truthfully")
-        self.assertEqual(path.read_text(), "browser:\n  allow_private_urls: true\n")
-
-    def test_a_setting_someone_made_themselves_is_left_where_it_is(self) -> None:
-        path = self.config("browser:\n  allow_private_urls: yes\n")
-        said = netexits._set_private_urls(False)
-        self.assertIn("left alone", said)
-        self.assertEqual(path.read_text(), "browser:\n  allow_private_urls: yes\n")
-
-    def test_the_setting_turned_off_on_purpose_is_not_a_finding(self) -> None:
-        self.config("browser:\n  allow_private_urls: false\n")
-        self.assertEqual(netexits._set_private_urls(False), "")
-        self.assertFalse(netexits.private_urls_allowed())
-
-    def test_doctor_names_the_setting_whoever_wrote_it(self) -> None:
-        """The risk is that Hermes is not refusing internal addresses, and
-        that is true either way. Who wrote the line decides the advice."""
-        self.config("browser:\n  allow_private_urls: true\n")
-        _ok, report = netexits.doctor()
-        self.assertIn("take it out by hand", report)
-        self.config(f"browser:\n  {netexits.PRIVATE_URLS_MARK}\n  allow_private_urls: true\n")
-        _ok, report = netexits.doctor()
-        self.assertIn("hermes vpn tor --off", report)
-
-    def test_leaving_the_mode_does_not_touch_a_config_with_nothing_of_ours(self) -> None:
-        """`net_use direct` calls it unconditionally, and clearing someone's
-        cookies over a setting they made themselves is not its business."""
-        self.config("browser:\n  allow_private_urls: true\n")
-        self.assertEqual(netexits.leave_tor_mode(), [])
+        self.assertTrue(netexits.guard_browser("browser_navigate",
+                                               {"url": "http://127.0.0.1/"}))
 
 
 class WhatWhereSaysAboutProtection(_Sandbox):
@@ -2496,6 +2365,7 @@ class TheOnionHoldKnowsWhatItIsHolding(_Sandbox):
         ]
         self.seeing(ok=True, ip="185.220.101.4", country="T1", city="")
         netexits.switch("exit-tor")
+        Path(self._dir.name, "config.yaml").write_text("browser:\n  allow_private_urls: true\n")
 
     def test_an_expired_circuit_is_not_described_as_one_that_never_existed(self) -> None:
         netexits._warm_onions[self.ONION] = time.time() - netexits.ONION_WARM_SECONDS - 60
@@ -2770,7 +2640,6 @@ class TorModeIsADifferentBrowser(_Sandbox):
         self.assertTrue(netexits.tor_mode())
         said = netexits.switch_sandbox("exit-mx", "hermes-box")
         self.assertFalse(netexits.tor_mode(), "the mode followed the sandbox to clearnet")
-        self.assertNotIn(netexits.PRIVATE_URLS_MARK, self.config.read_text())
         self.assertIn("Tor mode ended", said)
 
     def test_tor_off_returns_to_the_exit_from_before_tor(self) -> None:
@@ -2803,7 +2672,6 @@ class TorModeIsADifferentBrowser(_Sandbox):
         self.assertTrue(netexits.tor_mode())
         said = netexits.close_exit("exit-tor")
         self.assertFalse(netexits.tor_mode(), "the mode ended with the exit it ran on")
-        self.assertNotIn(netexits.PRIVATE_URLS_MARK, self.config.read_text())
         self.assertIn("Tor mode ended first", said)
 
     def test_javascript_turns_on_in_place_and_keeps_the_session(self) -> None:
@@ -2879,43 +2747,24 @@ class TorModeIsADifferentBrowser(_Sandbox):
         self.assertNotIn(netexits.TOR_PROFILE_DIR, live)
         self.assertNotIn(netexits.NO_JS_ARG, live)
 
-    def test_the_mode_is_recorded_before_the_setting_it_accounts_for(self) -> None:
-        """A crash between the two left Hermes' own refusal of internal
-        addresses off with the mode reading off, so the substitute never ran
-        either: both guards down, and the agent told nothing had happened."""
-        order: list = []
-        real_write, real_private = netexits._write_state, netexits._set_private_urls
-        netexits._write_state = lambda **kw: order.append("state" if "tor_mode" in kw else "other") or real_write(**kw)
-        netexits._set_private_urls = lambda on: order.append("config") or real_private(on)
-        self.addCleanup(lambda: setattr(netexits, "_write_state", real_write))
-        self.addCleanup(lambda: setattr(netexits, "_set_private_urls", real_private))
-        netexits.enter_tor_mode()
-        self.assertLess(order.index("state"), order.index("config"))
-
-    def test_the_cure_doctor_prescribes_can_actually_clean_up(self) -> None:
-        """`doctor` says to run `tor --off`; it returned immediately on the
-        state alone, so the loosened setting was permanent."""
-        netexits.tor_connect()
-        netexits._write_state(tor_mode={"on": False})  # as a crash would leave it
-        self.assertIn(netexits.PRIVATE_URLS_MARK, self.config.read_text())
-        netexits.leave_tor_mode()
-        self.assertNotIn(netexits.PRIVATE_URLS_MARK, self.config.read_text())
-
     def test_the_host_browser_gets_a_profile_of_its_own_and_no_script(self) -> None:
         netexits.tor_connect()
         args = netexits.browser_args("http://127.0.0.1:8899")
         self.assertIn(f"--user-data-dir={netexits.TOR_PROFILE_DIR}", args)
         self.assertIn(netexits.NO_JS_ARG, args)
 
-    def test_the_profile_is_allowed_to_reach_a_name_that_does_not_resolve(self) -> None:
-        netexits.tor_connect()
-        written = self.config.read_text()
-        self.assertIn("allow_private_urls: true", written)
-        self.assertIn(netexits.PRIVATE_URLS_MARK, written)
+    def test_the_profile_is_not_edited_and_the_person_is_told_what_to_set(self) -> None:
+        """Disabling Hermes' guard is a person's call, so the plugin never
+        writes the setting; entering Tor mode says what to add instead."""
+        before = self.config.read_text()
+        steps = netexits.enter_tor_mode()
+        self.assertEqual(self.config.read_text(), before, "the config was left untouched")
+        self.assertIn("allow-onion", " ".join(steps))
 
     def test_and_this_plugin_refuses_the_internal_ones_meanwhile(self) -> None:
-        """What Hermes stopped checking, this checks, for as long as it lasts."""
+        """What Hermes stopped checking, this checks, while the person allows it."""
         netexits.tor_connect()
+        self.config.write_text("browser:\n  allow_private_urls: true\n")
         for url in ("http://127.0.0.1:9222/json", "http://169.254.169.254/latest/meta-data/",
                     "http://10.0.0.5:8080/", "http://localhost:7681/",
                     "http://metadata.google.internal/"):
@@ -2928,6 +2777,7 @@ class TorModeIsADifferentBrowser(_Sandbox):
         will not read and Chrome will, and an IPv6 literal that raised out
         of the guard into the middleware's blanket except."""
         netexits.tor_connect()
+        self.config.write_text("browser:\n  allow_private_urls: true\n")
         for argument, why in (
             ({"note": "https://example.com/x", "url": "http://127.0.0.1:9051/"},
              "a benign URL in front"),
@@ -2954,6 +2804,7 @@ class TorModeIsADifferentBrowser(_Sandbox):
         self.assertIn("not an http or https address", str(caught.exception))
 
     def test_but_not_the_onion_it_is_there_for(self) -> None:
+        self.config.write_text("browser:\n  allow_private_urls: true\n")
         netexits.tor_connect("https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/")
         self.assertEqual(
             netexits.guard_browser(
@@ -2984,8 +2835,8 @@ class TorModeIsADifferentBrowser(_Sandbox):
         self.assertNotIn("allow_private_urls: true", self.config.read_text())
 
     def test_doctor_catches_a_setting_left_behind(self) -> None:
-        netexits.tor_connect()
-        netexits._write_state(tor_mode={"on": False})  # as a crash would leave it
+        self.config.write_text("browser:\n  allow_private_urls: true\n")
+        netexits._write_state(tor_mode={"on": False})
         _ok, report = netexits.doctor()
         self.assertIn("still allows private URLs", report)
 
@@ -3654,22 +3505,11 @@ class WhichProfileHermesSaysWeAre(_Sandbox):
     """Every test run takes the ImportError fallback; the host takes the other."""
 
     def _hermes_cli(self, value) -> None:
-        import types
-
-        package = types.ModuleType("hermes_cli")
-        module = types.ModuleType("hermes_cli.profiles")
-        if isinstance(value, Exception):
-            def current_profile_name():
-                raise value
-        else:
-            def current_profile_name():
-                return value
-        module.current_profile_name = current_profile_name
-        package.profiles = module
-        sys.modules["hermes_cli"] = package
-        sys.modules["hermes_cli.profiles"] = module
-        self.addCleanup(lambda: sys.modules.pop("hermes_cli", None))
-        self.addCleanup(lambda: sys.modules.pop("hermes_cli.profiles", None))
+        # Hermes hands the profile to register() as ctx.profile_name, which the
+        # plugin captures with set_profile_name. Simulate that here, in place of
+        # the old private hermes_cli.profiles import this used to monkeypatch.
+        netexits.set_profile_name(value)
+        self.addCleanup(lambda: netexits.set_profile_name(""))
 
     def test_hermes_own_answer_is_used_when_there_is_one(self) -> None:
         self._hermes_cli("lab")
@@ -4358,6 +4198,220 @@ class AddingAProviderFromAReference(unittest.TestCase):
         self.assertEqual(writer.call_args.args[1], config)
         self.assertNotIn("secret", said)
         self.assertIn("airvpn.env", said)
+
+
+class TheConfigSurgeryIsOnSomeoneElsesFile(_Sandbox):
+    """`hermes vpn allow-onion` edits a file this plugin did not write.
+
+    So every shape here is one a real config.yaml can have, and the test is
+    whether the file still means what it meant. Nothing imports a YAML
+    parser: the suite has no dependencies, and the thing that decides
+    whether it parses is the indent, which is checked directly.
+    """
+
+    def config(self, body: str) -> Path:
+        path = Path(self._dir.name) / "config.yaml"
+        with path.open("w", newline="") as handle:
+            handle.write(body)
+        return path
+
+    def indent_of(self, line: str) -> str:
+        return line[:len(line) - len(line.lstrip())]
+
+    def test_a_four_space_block_is_written_at_four_spaces(self) -> None:
+        """Two spaces into a four-space block is a line less indented than
+        its siblings, and the file stops parsing from there on."""
+        path = self.config("browser:\n    headless: true\n")
+        self.assertEqual(netexits._set_private_urls(True), "")
+        lines = path.read_text().split("\n")
+        ours = next(line for line in lines if "allow_private_urls" in line)
+        sibling = next(line for line in lines if "headless" in line)
+        self.assertEqual(self.indent_of(ours), self.indent_of(sibling))
+        self.assertEqual(self.indent_of(ours), "    ")
+
+    def test_a_tab_indented_block_keeps_its_tabs(self) -> None:
+        path = self.config("browser:\n\theadless: true\n")
+        netexits._set_private_urls(True)
+        ours = next(l for l in path.read_text().split("\n") if "allow_private_urls" in l)
+        self.assertEqual(self.indent_of(ours), "\t")
+
+    def test_a_comment_after_the_key_is_still_a_block(self) -> None:
+        """It was read as a shape this could not edit, so the mode came up
+        with the setting never written and said nothing was wrong."""
+        path = self.config("browser:  # the bot's own browser\n  headless: true\n")
+        self.assertEqual(netexits._set_private_urls(True), "")
+        self.assertIn("allow_private_urls: true", path.read_text())
+
+    def test_crlf_line_endings_survive(self) -> None:
+        path = self.config("browser:\r\n  headless: true\r\n")
+        netexits._set_private_urls(True)
+        with path.open(newline="") as handle:
+            after = handle.read()
+        self.assertIn("allow_private_urls: true\r\n", after)
+        self.assertEqual(after.count("\r\n"), after.count("\n"), "no ending was left bare")
+
+    def test_a_line_separator_inside_a_scalar_is_not_a_line(self) -> None:
+        """`splitlines()` breaks on U+2028 and the value came back changed."""
+        path = self.config('browser:\n  note: "a b"\n')
+        netexits._set_private_urls(True)
+        self.assertIn('"a b"', path.read_text())
+
+    def test_two_browser_keys_are_refused_rather_than_half_edited(self) -> None:
+        """YAML keeps the last, so writing into the first sets nothing."""
+        body = "browser:\n  headless: true\nmodel: x\nbrowser:\n  other: 1\n"
+        path = self.config(body)
+        said = netexits._set_private_urls(True)
+        self.assertIn("opens `browser:` 2 times", said)
+        self.assertEqual(path.read_text(), body, "and it did not touch the file")
+
+    def test_the_backup_is_never_wider_than_the_original(self) -> None:
+        path = self.config("browser:\n  headless: true\n")
+        path.chmod(0o600)
+        netexits._set_private_urls(True)
+        backups = list(Path(self._dir.name).glob("config.yaml.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+
+    def test_our_pair_goes_out_again_without_a_word(self) -> None:
+        path = self.config("browser:\n  headless: true\n")
+        netexits._set_private_urls(True)
+        self.assertEqual(netexits._set_private_urls(False), "")
+        self.assertFalse(netexits.private_urls_allowed())
+        self.assertIn("headless: true", path.read_text())
+
+    def test_a_config_with_no_browser_key_gets_it_back_unchanged(self) -> None:
+        """The key is appended when there is none, and an empty one left
+        behind reads as None, which breaks a lookup of `browser.anything`."""
+        path = self.config("model: opus\n")
+        netexits._set_private_urls(True)
+        self.assertIn("browser:", path.read_text())
+        netexits._set_private_urls(False)
+        self.assertEqual(path.read_text(), "model: opus\n")
+
+    def test_a_browser_block_that_was_already_there_stays(self) -> None:
+        path = self.config("browser:\n  headless: true\n")
+        netexits._set_private_urls(True)
+        netexits._set_private_urls(False)
+        self.assertEqual(path.read_text(), "browser:\n  headless: true\n")
+
+    def test_a_reformatted_value_under_our_marker_is_still_ours(self) -> None:
+        self.config(f"browser:\n  {netexits.PRIVATE_URLS_MARK}\n  allow_private_urls: True\n")
+        self.assertEqual(netexits._set_private_urls(False), "")
+        self.assertFalse(netexits.private_urls_allowed())
+
+    def test_a_setting_that_outlived_its_marker_is_reported_not_passed_over(self) -> None:
+        """Any program that round-trips this YAML drops the comment. Keying
+        the removal on it meant the setting stayed on, `tor --off` reported
+        success, and `doctor` could no longer see it either."""
+        path = self.config("browser:\n  allow_private_urls: true\n")
+        said = netexits._set_private_urls(False)
+        self.assertIn("still says", said)
+        self.assertIn("allow_private_urls", said)
+        self.assertTrue(netexits.private_urls_allowed(), "and it is still on, truthfully")
+        self.assertEqual(path.read_text(), "browser:\n  allow_private_urls: true\n")
+
+    def test_a_setting_someone_made_themselves_is_left_where_it_is(self) -> None:
+        path = self.config("browser:\n  allow_private_urls: yes\n")
+        said = netexits._set_private_urls(False)
+        self.assertIn("left alone", said)
+        self.assertEqual(path.read_text(), "browser:\n  allow_private_urls: yes\n")
+
+    def test_the_setting_turned_off_on_purpose_is_not_a_finding(self) -> None:
+        self.config("browser:\n  allow_private_urls: false\n")
+        self.assertEqual(netexits._set_private_urls(False), "")
+        self.assertFalse(netexits.private_urls_allowed())
+
+    def test_doctor_names_the_setting_and_points_at_the_command(self) -> None:
+        """The risk is that Hermes is not refusing internal addresses; the fix
+        is the one terminal command, whoever wrote the line."""
+        self.config("browser:\n  allow_private_urls: true\n")
+        _ok, report = netexits.doctor()
+        self.assertIn("allow-onion --off", report)
+        self.config(f"browser:\n  {netexits.PRIVATE_URLS_MARK}\n  allow_private_urls: true\n")
+        _ok, report = netexits.doctor()
+        self.assertIn("allow-onion --off", report)  # same advice, whoever wrote it
+
+    def test_leaving_the_mode_does_not_touch_a_config_with_nothing_of_ours(self) -> None:
+        """`net_use direct` calls it unconditionally, and clearing someone's
+        cookies over a setting they made themselves is not its business."""
+        self.config("browser:\n  allow_private_urls: true\n")
+        self.assertEqual(netexits.leave_tor_mode(), [])
+
+
+class RestartingHermesAfterAllowOnion(unittest.TestCase):
+    """allow-onion changes a setting Hermes reads only at startup, so it
+    restarts Hermes itself. How to do that varies by deployment."""
+
+    def test_an_operator_command_is_used_when_set(self) -> None:
+        with mock.patch.dict(os.environ, {netexits.RESTART_CMD_ENV: "do-restart --now"}), \
+             mock.patch.object(netexits.subprocess, "run") as run:
+            said = netexits.restart_hermes()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["do-restart", "--now"])
+        self.assertIn("restarted", said.lower())
+
+    def test_a_failed_operator_command_tells_you_to_restart(self) -> None:
+        with mock.patch.dict(os.environ, {netexits.RESTART_CMD_ENV: "nope"}), \
+             mock.patch.object(netexits.subprocess, "run", side_effect=OSError("boom")):
+            said = netexits.restart_hermes()
+        self.assertIn("could not restart", said.lower())
+
+    def test_a_single_systemd_unit_is_restarted(self) -> None:
+        import types
+        listed = types.SimpleNamespace(
+            stdout="hermes-gateway.service loaded active running Hermes gateway\n")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return listed if "list-units" in cmd else types.SimpleNamespace()
+
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(netexits.shutil, "which", return_value="/usr/bin/systemctl"), \
+             mock.patch.object(netexits.subprocess, "run", side_effect=fake_run):
+            os.environ.pop(netexits.RESTART_CMD_ENV, None)
+            said = netexits.restart_hermes()
+        self.assertIn("hermes-gateway.service", said)
+        self.assertTrue(any("restart" in c for c in calls), "it actually restarted it")
+
+    def test_without_a_way_it_hands_back_the_command(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(netexits.shutil, "which", return_value=None):
+            os.environ.pop(netexits.RESTART_CMD_ENV, None)
+            said = netexits.restart_hermes()
+        self.assertIn("restart hermes", said.lower())
+        self.assertIn(netexits.RESTART_CMD_ENV, said)
+
+
+class AllowOnionReportsWhetherItChanged(_Sandbox):
+    """So the CLI restarts Hermes only when the effective setting actually
+    flipped: running it twice must not bounce a live agent."""
+
+    def _cfg(self, body: str) -> None:
+        Path(self._dir.name, "config.yaml").write_text(body)
+
+    def test_turning_it_on_the_first_time_is_a_change(self) -> None:
+        self._cfg("browser:\n  inactivity_timeout: 120\n")
+        changed, said = netexits.allow_onion(True)
+        self.assertTrue(changed)
+        self.assertTrue(netexits.private_urls_allowed())
+        self.assertIn("written", said)
+
+    def test_turning_it_on_again_is_not_a_change(self) -> None:
+        self._cfg("browser:\n  allow_private_urls: true\n")
+        changed, _said = netexits.allow_onion(True)
+        self.assertFalse(changed, "already on, so nothing to restart for")
+
+    def test_turning_it_off_when_set_is_a_change(self) -> None:
+        self._cfg(f"browser:\n  {netexits.PRIVATE_URLS_MARK}\n  allow_private_urls: true\n")
+        changed, _said = netexits.allow_onion(False)
+        self.assertTrue(changed)
+        self.assertFalse(netexits.private_urls_allowed())
+
+    def test_turning_it_off_when_absent_is_not_a_change(self) -> None:
+        self._cfg("browser:\n  inactivity_timeout: 120\n")
+        changed, _said = netexits.allow_onion(False)
+        self.assertFalse(changed)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 name: hermes-vpn
-version: 0.2.0
+version: 0.3.0
 description: >
   Named network exits for the agent's browser. Ask it to browse from another
   country and it switches, verifies the exit by reading back the address the far
@@ -27,7 +27,6 @@ provides_tools:
   - net_doctor
   - net_providers
   - net_provider_setup
-  - net_add_provider
   - net_open
   - net_close
 provides_middleware:
@@ -70,4 +69,8 @@ optional_env:
   - name: NET_EXITS_PROFILE
     description: "Overrides which Hermes profile this agent believes it is running as. For testing: getting it wrong makes the plugin act on the wrong browser."
     prompt: "Profile name override"
+    password: false
+  - name: NET_EXITS_RESTART_CMD
+    description: "Command `hermes vpn allow-onion` runs to restart Hermes after it changes browser.allow_private_urls (Hermes reads that only at startup). If unset, it restarts a lone systemd --user service whose name holds hermes, or prints the command to run."
+    prompt: "Hermes restart command"
     password: false

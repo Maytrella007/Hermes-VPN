@@ -36,6 +36,7 @@ no back-porting to older tags.
 
 - The browser leaving by the host's own address when an exit is believed up.
 - WebRTC, DNS, or any path out of a sealed sandbox that is not the tunnel.
-- The guard letting the browser reach a private or internal address while Tor
-  mode's `allow_private_urls` is on.
+- The guard letting the browser reach a private or internal address while
+  `allow_private_urls` is on (that is, while Hermes' own refusal is off),
+  whether or not Tor mode is on.
 - Anything that makes the helper act outside its exact-path grant.

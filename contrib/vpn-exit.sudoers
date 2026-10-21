@@ -15,7 +15,12 @@
 # Anything else, including an extra word, is refused before it does anything.
 #
 # There is one more verb, set-credentials <name>, which writes a provider's
-# root-only env file. It is for a person at the host, not the agent: it refuses
-# unless stdin is an interactive terminal, and the agent only ever reaches the
-# helper with its output captured, so it has no terminal to offer.
+# root-only env file. It refuses unless stdin is an interactive terminal, so a
+# plugin tool -- which reaches the helper with its output captured and no
+# terminal -- cannot be talked into writing a chat-pasted secret through it.
+# There is deliberately no model tool for it. The two ways to satisfy the
+# terminal check are both started by a person at the host: typing the config
+# at `hermes vpn provider <name> --set`, or the terminal-only `--from-ref`,
+# which reads the config from a vault the person set up and feeds it over a
+# terminal on their behalf, never a secret pasted into a chat.
 @AGENT_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/vpn-exit

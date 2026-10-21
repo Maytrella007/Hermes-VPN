@@ -135,17 +135,19 @@ Paste the whole WireGuard config, then press **Ctrl-D**. It writes
 key. (An IPv6 tunnel address is dropped automatically on a host without IPv6;
 the preshared key is kept.)
 
-**B — by vault reference** (the agent can do this one for you): if you already
-keep the config in [`pass`/`gopass`](https://www.passwordstore.org/) or in a
-file on the host, give the agent only a *reference*, never the secret:
+**B — by vault reference** (also at a terminal): if you already keep the config
+in [`pass`/`gopass`](https://www.passwordstore.org/) or in a file on the host,
+pass only a *reference*, never the secret:
 
 ```bash
 hermes vpn provider airvpn --from-ref pass:vpn/airvpn
 hermes vpn provider airvpn --from-ref file:/home/you/airvpn.conf
 ```
 
-The plugin resolves the reference host-side and writes the same root-only file
-without the contents ever being a tool return or a message.
+It explains what it will write and asks you to confirm, then resolves the
+reference host-side and writes the same root-only file; the contents are never
+printed or logged. This is a terminal command **you** run: there is no agent
+tool that adds a provider, so the agent cannot do it even if asked.
 
 > If you offer to paste the key into the chat, the agent is built to **decline**
 > and point you back here. That is working as intended, not a refusal to help.

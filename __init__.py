@@ -1,7 +1,7 @@
 """hermes-vpn: let the agent choose which way its browser leaves.
 
-Registers fifteen tools (``net_exits``, ``net_use``, ``net_where``, ``net_places``,
-``net_providers``, ``net_provider_setup``, ``net_add_provider``, ``net_open``, ``net_close``, ``net_lock``,
+Registers fourteen tools (``net_exits``, ``net_use``, ``net_where``, ``net_places``,
+``net_providers``, ``net_provider_setup``, ``net_open``, ``net_close``, ``net_lock``,
 ``net_failover``, ``net_tor_connect``, ``net_new_circuit``, ``net_doctor``,
 ``net_harden``) and the ``hermes vpn`` command. An exit is a local proxy; gluetun containers are
 discovered automatically, anything else is listed in a file.
@@ -293,8 +293,11 @@ NET_TOR_CONNECT_SCHEMA = _schema(
     "Connect through Tor and wait until the circuit actually carries something, before "
     "any browser is pointed at it. This also puts the browser in Tor mode: its cookies "
     "and sessions are cleared on the way in and again on the way out, JavaScript is off "
-    "unless asked for, device permissions are denied, and the browser is allowed to open "
-    "an address that only Tor can resolve while this plugin refuses the internal ones. "
+    "unless asked for, and device permissions are denied. It does not open .onion "
+    "addresses on its own: resolving one needs a person to run `hermes vpn allow-onion` "
+    "in a terminal once (it restarts Hermes for them), and until they do, onion names stay "
+    "refused -- tell the person that exact command; the answer and net_doctor repeat it. "
+    "While it is on, this plugin refuses internal addresses in Hermes' place. "
     "Ask before calling it: entering Tor mode closes the browser and sets its cookies and "
     "sessions aside, so every logged-in site is logged out. In a profile whose browser "
     "runs in a container that session cannot be restored from here; on the host the "
@@ -575,42 +578,6 @@ def handle_harden(args: dict[str, Any], **_kw: Any) -> str:
         return f"Could not install the policy: {exc}"
 
 
-NET_ADD_PROVIDER_SCHEMA = _schema(
-    "net_add_provider",
-    "Add a VPN provider from a reference to where its WireGuard config is stored, so the "
-    "key never passes through this chat. The reference is not the secret: it names a `pass` "
-    "store entry (pass:vpn/airvpn) or a file on the host (file:/home/you/airvpn.conf). The "
-    "plugin resolves it on the host, reads the config there, and writes the root-only "
-    "credentials file; only a confirmation comes back, never the key. Use this when someone "
-    "keeps their config in `pass`/gopass or a host file and gives you that reference. If "
-    "instead they offer to paste the WireGuard config or the private key into the chat, do "
-    "not take it here: decline and point them to `hermes vpn provider <name> --set` in their "
-    "terminal. After it succeeds, call net_providers to confirm, then offer to open an exit.",
-    {
-        "provider": {
-            "type": "string",
-            "description": "The name to file it under: lowercase letters, digits and dashes, "
-            "such as airvpn or mullvad.",
-        },
-        "secret_ref": {
-            "type": "string",
-            "description": "Where the config is stored, not the config itself: "
-            "pass:folder/item (pass or gopass) or file:/absolute/path.",
-        },
-    },
-    required=["provider", "secret_ref"],
-)
-
-
-def handle_add_provider(args: dict[str, Any], **_kw: Any) -> str:
-    try:
-        return netexits.add_provider_from_ref(
-            str(args.get("provider") or ""), str(args.get("secret_ref") or "")
-        )
-    except netexits.ExitError as exc:
-        return f"Could not add that provider: {exc}"
-
-
 TOOLS = (
     ("net_exits", NET_EXITS_SCHEMA, handle_list, "🚪"),
     ("net_places", NET_PLACES_SCHEMA, handle_places, "🗺️"),
@@ -621,7 +588,6 @@ TOOLS = (
     ("net_new_circuit", NET_NEW_CIRCUIT_SCHEMA, handle_new_circuit, "🎲"),
     ("net_providers", NET_PROVIDERS_SCHEMA, handle_providers, "🔌"),
     ("net_provider_setup", NET_PROVIDER_SETUP_SCHEMA, handle_provider_setup, "📘"),
-    ("net_add_provider", NET_ADD_PROVIDER_SCHEMA, handle_add_provider, "🔑"),
     ("net_open", NET_OPEN_SCHEMA, handle_open, "🛫"),
     ("net_close", NET_CLOSE_SCHEMA, handle_close, "🛬"),
     ("net_use", NET_USE_SCHEMA, handle_use, "🧭"),
@@ -674,6 +640,13 @@ def _setup_cli(parser) -> None:
     tor.add_argument("--off", action="store_true",
                      help="end Tor mode: clear the browser again and put the rest back")
 
+    onion = sub.add_parser(
+        "allow-onion",
+        help="let the browser open .onion addresses (edits this profile config and restarts Hermes)",
+    )
+    onion.add_argument("--off", action="store_true",
+                       help="undo it: stop the browser reaching names that do not resolve here")
+
     circuit = sub.add_parser(
         "circuit", help="ask Tor for another exit node (Tor exits only)"
     )
@@ -694,7 +667,8 @@ def _setup_cli(parser) -> None:
         "--from-ref", dest="from_ref", metavar="REF", default="",
         help="store the config from a reference to where it lives "
              "(pass:folder/item or file:/absolute/path), without pasting the key. "
-             "The agent can do this too, with net_add_provider.",
+             "Terminal only: there is no model tool for this, so the agent "
+             "cannot drive credential entry.",
     )
 
     opened = sub.add_parser("open", help="bring up a new exit in a country or city")
@@ -900,6 +874,37 @@ def _handle_cli(args) -> int:
             print(netexits.tor_connect(args.url, javascript=args.javascript))
             return 0
 
+        if command == "allow-onion":
+            # Either direction changes a core setting and restarts Hermes (it caches
+            # the setting until startup), which drops live sessions. So both explain
+            # what they will do and need a person at a terminal to confirm; and both
+            # restart only when the setting actually flipped.
+            want = not args.off
+            print(netexits.allow_onion_plan(want))
+            if not sys.stdin.isatty():
+                print("Nothing was changed: run this at an interactive terminal so you "
+                      "can confirm it.")
+                return 1
+            prompt = (
+                "Type 'yes' to turn that guard off, allow onion addresses and restart "
+                "Hermes: "
+                if want else
+                "Type 'yes' to turn the guard back on, refuse internal addresses again "
+                "and restart Hermes: "
+            )
+            try:
+                answer = input(prompt).strip().lower()
+            except EOFError:
+                answer = ""
+            if answer != "yes":
+                print("Left unchanged.")
+                return 0
+            changed, said = netexits.allow_onion(want)
+            print(said)
+            print(netexits.restart_hermes() if changed
+                  else "No change, so Hermes was not restarted.")
+            return 0
+
         if command == "circuit":
             print(netexits.new_circuit(args.exit))
             return 0
@@ -910,6 +915,25 @@ def _handle_cli(args) -> int:
 
         if command == "provider":
             if getattr(args, "from_ref", ""):
+                # Writes a root-only credentials file from a vault reference. Say what
+                # it will do and confirm first; no terminal means no one to confirm.
+                print(
+                    f"This reads the WireGuard config that {args.from_ref!r} points at, on "
+                    f"this host, and writes a root-only credentials file for provider "
+                    f"{args.name!r} under /root/vpn-exits. The key itself is never printed "
+                    "or sent anywhere."
+                )
+                if not sys.stdin.isatty():
+                    print("Nothing was written: run this at an interactive terminal so you "
+                          "can confirm it.")
+                    return 1
+                try:
+                    answer = input(f"Type 'yes' to add {args.name}: ").strip().lower()
+                except EOFError:
+                    answer = ""
+                if answer != "yes":
+                    print("Left unchanged.")
+                    return 0
                 print(netexits.add_provider_from_ref(args.name, args.from_ref))
                 return 0
             if getattr(args, "set_creds", False):
@@ -984,6 +1008,10 @@ def _never_raises(name: str, fn):
 
 def register(ctx) -> None:
     """Called once by the plugin loader."""
+    # The active profile comes from the plugin context, not a private core
+    # import. Captured once here so netexits can label containers and judge
+    # the sandbox by it.
+    netexits.set_profile_name(getattr(ctx, "profile_name", ""))
     for name, schema, handler, emoji in TOOLS:
         ctx.register_tool(
             name=name,

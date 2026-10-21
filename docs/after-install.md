@@ -49,7 +49,7 @@ loopback**. They are discovered automatically — no configuration lists them:
 # /root/vpn-exits/docker-compose.yml
 services:
   mx:
-    image: qmcgaw/gluetun:latest
+    image: qmcgaw/gluetun:latest   # pin to a digest in production, e.g. qmcgaw/gluetun@sha256:...
     container_name: exit-mx         # `exit-…`: how the helper recognises its own
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun:/dev/net/tun"]

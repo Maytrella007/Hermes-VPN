@@ -23,7 +23,6 @@ It adds **no tunnel and no dependency**. An *exit* is just a local proxy, so any
 | `net_failover` | name a standby exit and let a dead one be swapped for it (off by default) |
 | `net_tor_connect` / `net_new_circuit` | enter Tor as a mode, and ask for a fresh circuit |
 | `net_providers` / `net_provider_setup` | which VPNs have credentials here, and what each one needs |
-| `net_add_provider` | add a provider from a vault reference (`pass:`/`file:`), so the key never passes through the chat |
 | `net_harden` | install the browser-wide WebRTC policy so the protection cannot be lost |
 | `net_doctor` | what is protecting this browsing and what is not, with the fix for each gap |
 
@@ -128,7 +127,9 @@ hermes vpn doctor                 # the checklist, with a fix per gap
 hermes vpn harden                 # the browser-wide WebRTC policy
 ```
 
-Each has an `net_*` tool behind it so the agent can do the same from a sentence (*"turn on security mode"* arms the kill switch).
+Each has an `net_*` tool behind it so the agent can do the same from a sentence (*"turn on security mode"* arms the kill switch). The one exception is credential entry: a provider is added only from a terminal (`hermes vpn provider <name> --set`, or `--from-ref` to read it from a `pass`/`gopass` or file reference), never through a model tool, so the agent can never be talked into writing a key.
+
+> **Opening a `.onion` takes one terminal command.** Resolving an onion means turning off Hermes' own refusal of addresses that do not resolve on this host (its SSRF guard). Disabling a core security guard is a person's call, so **no model tool does it** — you run `hermes vpn allow-onion` in a terminal (and `--off` to undo it). It explains what it will change, asks you to confirm, safely sets `browser.allow_private_urls` in the profile's `config.yaml`, and **restarts Hermes for you** so the change takes effect (Hermes reads the setting only at startup). If it cannot tell how your Hermes is run, set `NET_EXITS_RESTART_CMD` to the restart command once. Until it is on, onion navigation is held and the agent hands you that exact command; while it is on, this plugin refuses internal addresses in Hermes' place.
 
 ## Setting up exits
 
@@ -137,7 +138,7 @@ A **gluetun** container is found automatically: publish its HTTP proxy **on loop
 ```yaml
 services:
   mx:
-    image: qmcgaw/gluetun:latest
+    image: qmcgaw/gluetun:latest   # pin to a digest in production, e.g. qmcgaw/gluetun@sha256:...
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun:/dev/net/tun"]
     environment:

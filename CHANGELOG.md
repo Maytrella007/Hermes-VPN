@@ -6,6 +6,33 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-21
+
+### Changed (plugin-catalog review)
+- **No model tool edits Hermes' `config.yaml` any more.** Entering Tor mode used
+  to write `browser.allow_private_urls` (which turns off Hermes' own SSRF guard)
+  from a path the model could reach. Disabling a core guard is a person's call
+  now, so the edit moved to a terminal-only command, **`hermes vpn allow-onion`**
+  (and `--off`). It explains the change, asks you to confirm, and then restarts
+  Hermes itself so it takes effect (via `NET_EXITS_RESTART_CMD`, a detected
+  systemd `--user` unit, or a printed fallback). The Tor flow, the onion guard
+  and `net_doctor` all hand you that one command and hold onion navigation until
+  you run it.
+- **`hermes vpn provider <name> --from-ref` now confirms first.** Before writing
+  a root-only credentials file from a vault reference it says what it will do and
+  asks, and refuses when there is no terminal to confirm at.
+- **Credential entry is terminal-only; the `net_add_provider` model tool is gone.**
+  Adding a provider from a vault reference stays on the human CLI (`hermes vpn
+  provider <name> --from-ref`); there is no tool the agent can drive to do it. The
+  plugin now registers fourteen tools, not fifteen.
+- **The browser sandbox is not weakened.** `browser_args` no longer forces
+  `--no-sandbox`; it appends only the proxy and WebRTC flags to whatever Hermes set,
+  so core keeps the sandbox on when it can.
+- **The active profile comes from `ctx.profile_name`,** captured in `register()`,
+  instead of importing the private `hermes_cli.profiles` core module.
+- **The gluetun image is pinned by digest** (`qmcgaw/gluetun:v3.41.3@sha256:...`),
+  not `:latest`, since the root helper pulls and runs it with NET_ADMIN.
+
 ## [0.2.0] - 2026-10-19
 
 ### Changed
@@ -34,14 +61,15 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   path as well as the tool path, so a reader can tell "fine" from "act" at a glance.
 
 ### Added
-- **Add a provider from a vault reference, key off the chat: `net_add_provider` /
-  `hermes vpn provider <name> --from-ref`.** For a phone-first user with no terminal,
-  the config lives in a password store and the bot is told only a *reference* to it,
-  never the key. The plugin resolves the reference on the host and writes the root-only
-  credentials file; only a confirmation comes back. References are `pass:folder/item`
-  (the `pass` password store, or gopass, both local and GPG-backed) and
-  `file:/absolute/path`; a raw secret or an `env:` reference is refused, so a key can
-  never be pasted in as if it were a reference.
+- **Add a provider from a vault reference, on the human CLI: `hermes vpn
+  provider <name> --from-ref`.** The config lives in a password store and the
+  command is told only a *reference* to it, never the key. The plugin resolves
+  the reference on the host and writes the root-only credentials file; only a
+  confirmation comes back. References are `pass:folder/item` (the `pass`
+  password store, or gopass, both local and GPG-backed) and `file:/absolute/path`;
+  a raw secret or an `env:` reference is refused, so a key can never be pasted in
+  as if it were a reference. Terminal only: there is deliberately no model tool
+  for it, so the agent can never drive credential entry.
 - **Guided first-run: `hermes vpn setup`.** One terminal command walks the
   whole first run in order — checks the host side is installed, shows `doctor`,
   offers to add a provider (through the terminal `--set` path, so the secret

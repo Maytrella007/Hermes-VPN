@@ -42,8 +42,10 @@ from typing import Any, Iterable
 #: Chromium reads its proxy from the command line, and Hermes passes extra
 #: arguments through this variable, comma separated.
 BROWSER_ARGS_ENV = "AGENT_BROWSER_ARGS"
-#: Setting the variable replaces Hermes's own defaults, so they are re-added.
-BASE_BROWSER_ARGS = ("--no-sandbox", "--disable-dev-shm-usage")
+#: Core owns the browser's sandbox posture: it appends --no-sandbox itself
+#: when the sandbox needs it. This plugin never forces that, so it adds only
+#: the flags that are its own to set (proxy, WebRTC, the Tor profile) onto
+#: whatever AGENT_BROWSER_ARGS already holds.
 
 #: Where a manual list of exits can live (gluetun needs no file).
 EXITS_FILE_ENV = "NET_EXITS_FILE"
@@ -1166,25 +1168,31 @@ def guard_browser(tool_name: str, call_args: Any = None) -> str:
     if not str(tool_name).startswith("browser_"):
         return ""
 
-    # Not `tor_mode()` alone. The question is whether Hermes' own refusal of
-    # internal addresses is off, and the mode turns it off by writing a line
-    # into the profile config under a marker. A path that leaves that line
-    # behind while the state says the mode is off -- a sandbox `net_use`, a
-    # `close_exit`, a state write that drops the key -- would otherwise take
-    # both guards down at once. The marker is there as long as the line is,
-    # so gate on it too.
-    if tor_mode() or PRIVATE_URLS_MARK in _read_profile_config():
+    # The question is whether Hermes' own refusal of internal addresses is
+    # off, which is exactly when the profile config allows private URLs -- a
+    # line a person sets, never this plugin. Whenever it is off, this guard
+    # stands in for it.
+    if private_urls_allowed():
         # Hermes' own check is off and this one is what is left. It says no
         # to the destinations that check existed for.
         local = _private_destination(call_args)
         if local:
             return (
-                f"Refused: {local}, and Tor mode has turned off the browser's own refusal "
-                "of internal addresses so that onion names can resolve. Nothing on this "
-                "machine is reachable through Tor anyway."
+                f"Refused: {local}, and the profile config allows private URLs, so Hermes' "
+                "own refusal of internal addresses is off. Nothing on this machine is "
+                "reachable through Tor anyway."
             )
 
     onion = _onion_in(call_args)
+    if onion and not private_urls_allowed():
+        # Hermes still refuses addresses that do not resolve here, which every
+        # onion is, and this plugin does not turn that off for anyone.
+        return (
+            f"Held: {onion} is an onion address, and Hermes still refuses addresses that "
+            "do not resolve on this machine. In a terminal run `hermes vpn allow-onion` "
+            "(it confirms, sets the config and restarts Hermes for you); then "
+            "`net_tor_connect` can open onion names."
+        )
     if onion and _onion_is_warm(onion):
         # The browser is about to use it, which is better evidence than the
         # last check: without this the clock ran from the warm-up and the
@@ -1316,8 +1324,24 @@ WEBRTC_SETTING = "disable_non_proxied_udp"
 WEBRTC_ARG = f"--webrtc-ip-handling-policy={WEBRTC_SETTING}"
 
 
+#: The flags this plugin owns, stripped off the existing value before fresh
+#: ones are appended so that repeated switches do not pile up stale entries.
+_OUR_ARG_PREFIXES = (
+    "--proxy-server=",
+    "--webrtc-ip-handling-policy=",
+    "--user-data-dir=",
+)
+
+
 def browser_args(proxy: str = "") -> str:
-    args = list(BASE_BROWSER_ARGS)
+    # Start from what Hermes already put here, minus anything a previous switch
+    # of ours left behind. Core's own defaults -- the sandbox bypass included
+    # -- are whatever it set, and they are kept untouched.
+    args = [
+        arg
+        for arg in (os.environ.get(BROWSER_ARGS_ENV) or "").split(",")
+        if arg and not arg.startswith(_OUR_ARG_PREFIXES) and arg != NO_JS_ARG
+    ]
     if proxy:
         args.append(f"--proxy-server={proxy}")
         args.append(WEBRTC_ARG)
@@ -1910,14 +1934,16 @@ def guide(provider: str) -> str:
         f"1. In {wanted}'s own dashboard, generate a WireGuard config: a private key "
         "and an address. The exact steps for this provider are under \"Required "
         "environment variables\" below.\n"
-        "2. Store it on the host, without the key ever passing through this chat. Either:\n"
-        f"   - at a terminal (the dashboard's Terminal tab works from a phone too): run "
-        f"`hermes vpn provider {wanted} --set`, then paste the config and press Ctrl-D; or\n"
-        "   - if you already keep secrets in `pass`/gopass or a file, give a reference "
-        f"and the agent can do it for you: `hermes vpn provider {wanted} --from-ref "
-        f"pass:vpn/{wanted}` (or `--from-ref file:/path/to/{wanted}.conf`).\n"
-        f"   Either way it writes the root-only /root/vpn-exits/{wanted}.env; the agent "
-        "never sees the key. Never paste the key into the chat.\n"
+        "2. Store it on the host from a terminal (the dashboard's Terminal tab works from "
+        "a phone too); the key never passes through this chat. Either:\n"
+        f"   - run `hermes vpn provider {wanted} --set`, then paste the config and press "
+        "Ctrl-D; or\n"
+        "   - if you already keep secrets in `pass`/gopass or a file, run `hermes vpn "
+        f"provider {wanted} --from-ref pass:vpn/{wanted}` (or `--from-ref "
+        f"file:/path/to/{wanted}.conf`), which reads the config from there.\n"
+        f"   Either writes the root-only /root/vpn-exits/{wanted}.env. Both are terminal "
+        "commands you run; the key never passes through the chat, and no agent tool "
+        "adds a provider.\n"
         "3. Then `hermes vpn open <country>` brings up the exit and verifies it.\n"
         "You do not need the docker or compose commands; `hermes vpn open` builds the "
         "container for you.\n\n"
@@ -2631,6 +2657,9 @@ def _looks_like_wireguard(config: str) -> bool:
 def _write_credentials_via_helper(provider: str, config: str) -> str:
     """Feed a resolved config to the helper's set-credentials over a pty.
 
+    Reachable only from the human `hermes vpn provider <name> --from-ref`
+    CLI; there is no model tool for it, so the agent cannot drive this.
+
     ``set-credentials`` guards on an interactive terminal, so a chat-pasted
     secret can never be written by the agent. This path never carries a
     chat-pasted secret: the config came from a vault the user set up and was
@@ -2780,6 +2809,19 @@ def read_sighting(said: str) -> tuple[str, str, str]:
 PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}\Z")
 
 
+#: Captured from the plugin context in register(). Hermes knows the active
+#: profile; the plugin takes it from `ctx` rather than importing a private
+#: core module to learn it. "" until register() runs, in which case the
+#: HERMES_HOME fallback below answers instead.
+_ctx_profile_name: str = ""
+
+
+def set_profile_name(name: object) -> None:
+    """Remember the profile register() was handed, as a plain string."""
+    global _ctx_profile_name
+    _ctx_profile_name = name.strip() if isinstance(name, str) else ""
+
+
 def current_profile() -> str:
     """Which profile this agent is running as."""
     override = (os.environ.get(PROFILE_ENV) or "").strip()
@@ -2790,21 +2832,17 @@ def current_profile() -> str:
         )
     if override:
         return override
-    try:
-        from hermes_cli.profiles import current_profile_name  # type: ignore
-
-        named = current_profile_name()
-        # A string, or nothing. This value becomes a docker label filter
-        # (`label=hermes-profile=<this>`), so an object's repr matches no
-        # container, `in_sandbox()` answers "" for a sandboxed profile, and
-        # the kill switch falls back to judging the host's proxy for a browser
-        # that does not use it. `str()` on whatever Hermes returns was one
-        # refactor away from that.
-        if isinstance(named, str) and named.strip():
-            return named.strip()
-    except Exception:
-        pass
-    # Same signal Hermes itself derives it from, in case the import moves.
+    # Captured from the plugin context in register(), never imported from a
+    # private core module. This value becomes a docker label filter
+    # (`label=hermes-profile=<this>`), so a non-name matches no container,
+    # `in_sandbox()` answers "" for a sandboxed profile, and the kill switch
+    # falls back to judging the host's proxy for a browser that does not use
+    # it; so it is validated like the override before it is trusted.
+    named = _ctx_profile_name
+    if named and PROFILE_NAME.match(named):
+        return named
+    # Same signal Hermes itself derives it from, for when register() has not
+    # run (a contrib script, a test).
     # Validated like the override above: HERMES_HOME is as settable, and an
     # unchecked `.../profiles/--city` became the profile name, which the
     # helper then read as a flag and moved the shared relay. A name that is
@@ -3202,11 +3240,6 @@ def tor_mode() -> dict[str, Any]:
     return mode if isinstance(mode, dict) and mode.get("on") else {}
 
 
-#: The line the plugin writes into a profile's config, and the comment that
-#: marks it as ours. Removing it again is a text edit on someone else's file,
-#: so it has to be findable without guessing.
-PRIVATE_URLS_MARK = "# hermes-vpn: Tor mode, removed when it ends"
-PRIVATE_URLS_LINE = "allow_private_urls: true"
 
 
 def _read_profile_config() -> str:
@@ -3222,17 +3255,22 @@ def profile_config() -> Path:
     return hermes_home() / "config.yaml"
 
 
+#: The line `hermes vpn allow-onion` writes into a profile config, and the
+#: comment that marks it as ours so `--off` removes only what it added.
+PRIVATE_URLS_MARK = "# hermes-vpn: allow-onion, remove with `hermes vpn allow-onion --off`"
+PRIVATE_URLS_LINE = "allow_private_urls: true"
+
 #: A `browser:` line that opens a block, with an optional trailing comment.
 #: Anything else beginning with `browser:` is a flow mapping or an anchor,
 #: which this cannot edit without rewriting someone's file by guesswork.
 BROWSER_KEY = re.compile(r"^(?P<indent>[ \t]*)browser:[ \t]*(?:#.*)?$")
 
-#: The setting itself, however it ended up written. PRIVATE_URLS_MARK says a
-#: line is ours; this says the setting is on, which is what the browser acts
-#: on and therefore what the removal, `leave_tor_mode` and `doctor` have to
-#: look for. Keying any of them on the comment alone meant that a config run
-#: through a YAML library once -- which drops comments -- left the setting on
-#: with nothing able to see it.
+
+
+#: Whether the profile config allows private URLs, however it was written.
+#: This is what the browser acts on, so it is what the guard, `leave_tor_mode`
+#: and `doctor` look for. Matching the value (not a comment) means a config run
+#: through a YAML library once -- which drops comments -- is still seen.
 PRIVATE_URLS_SET = re.compile(
     r"^[ \t]*allow_private_urls[ \t]*:[ \t]*(?:true|yes|on|y|1)[ \t]*(?:#.*)?$",
     re.IGNORECASE,
@@ -3242,6 +3280,25 @@ PRIVATE_URLS_SET = re.compile(
 def private_urls_allowed() -> bool:
     """Whether this profile's config leaves internal addresses reachable."""
     return any(PRIVATE_URLS_SET.match(line) for line in _read_profile_config().split("\n"))
+
+
+def _private_urls_todo() -> str:
+    """The one terminal command that lets onion names resolve.
+
+    A person runs it; there is no model tool for it. Turning it on disables
+    Hermes' own refusal of addresses that do not resolve here (its SSRF guard),
+    which is a call for a person. Hermes reads it once at startup, so it needs
+    a restart.
+    """
+    return (
+        "onion addresses stay refused until you allow them. In a terminal (the "
+        "Terminal tab in Hermes Desktop or the dashboard, or your shell) run:\n\n"
+        "  hermes vpn allow-onion\n\n"
+        "It explains the change, asks you to confirm, sets the config and restarts Hermes "
+        "for you. That lifts Hermes' own refusal of addresses that do not resolve here, so "
+        "it is your call, not mine; while it is on this plugin refuses internal addresses "
+        "in its place. Undo it with `hermes vpn allow-onion --off`."
+    )
 
 
 def _without_an_empty_browser_block(lines: list[str]) -> list[str]:
@@ -3286,17 +3343,19 @@ def _block_indent(lines: list[str], start: int) -> str:
 def _set_private_urls(on: bool) -> str:
     """Let the browser reach a name that does not resolve here, or stop it.
 
-    An onion address resolves at the far end of the tunnel and nowhere else,
-    so Hermes' own check -- which resolves the hostname before navigating,
-    as SSRF protection -- refuses every one of them. This turns that check
-    off for as long as Tor mode lasts, and the guard in this plugin takes
-    over what it can of the job in the meantime.
+    Run only from `hermes vpn allow-onion` (and `--off`), a terminal command
+    a person starts, never from a model tool. An onion address resolves at
+    the far end of the tunnel and nowhere else, so Hermes' own check -- which
+    resolves the hostname before navigating, as SSRF protection -- refuses
+    every one of them. Turning it on lifts that check for this profile, and
+    the guard in this plugin refuses internal addresses in its place while it
+    is on. Hermes reads the setting only at startup, so the caller restarts.
 
-    The line is written with a marker so that taking it out again is an
-    exact edit rather than a guess at someone else's file, and the removal
-    only ever touches the pair this wrote. A setting that outlives its
-    marker is reported rather than removed, and rather than passed over:
-    whoever reads the answer has to know the browser is still open.
+    The line is written with a marker so that taking it out again is an exact
+    edit rather than a guess at someone else's file, and the removal only ever
+    touches the pair this wrote. A setting that outlives its marker is reported
+    rather than removed: whoever reads the answer has to know the browser is
+    still reachable.
     """
     path = profile_config()
     try:
@@ -3393,6 +3452,95 @@ def _set_private_urls(on: bool) -> str:
     except OSError as exc:
         return f"the profile config at {path} could not be written ({exc})"
     return warning
+
+
+def allow_onion(on: bool) -> str:
+    """Turn `allow_private_urls` on or off for this profile, from the CLI.
+
+    A person runs this (`hermes vpn allow-onion` / `--off`); there is no model
+    tool for it. Returns (changed, message): the caller restarts Hermes only when
+    the effective setting actually flipped, so running it twice does not bounce a
+    live agent for nothing.
+    """
+    before = private_urls_allowed()
+    note = _set_private_urls(on)  # "" on a clean change, else why it did not
+    changed = private_urls_allowed() != before
+    if note:
+        return changed, note
+    if on:
+        return changed, f"allow_private_urls: true written to {profile_config()}."
+    return changed, f"allow_private_urls removed from {profile_config()}."
+
+
+def allow_onion_plan(on: bool) -> str:
+    """Spell out what allow-onion is about to change, before it changes it."""
+    if on:
+        return (
+            f"This sets `allow_private_urls: true` in {profile_config()}, which turns OFF "
+            "Hermes' own refusal of addresses that do not resolve on this host (its SSRF "
+            "guard) for this profile. The browser will then be able to reach loopback and "
+            "LAN addresses, not only .onion names; this plugin refuses the internal ones in "
+            "Hermes' place while it is on. A timestamped backup of the config is written "
+            "first, then this command restarts Hermes so it takes effect (Hermes reads this "
+            "only at startup)."
+        )
+    return (
+        f"This removes the `allow_private_urls` line this command added from "
+        f"{profile_config()}, turning Hermes' refusal of internal addresses back on for "
+        "this profile, then restarts Hermes so it takes effect."
+    )
+
+
+#: An operator can name the exact command that restarts their Hermes, for
+#: deployments this cannot guess (docker, a process manager, a wrapper).
+RESTART_CMD_ENV = "NET_EXITS_RESTART_CMD"
+
+
+def restart_hermes() -> str:
+    """Restart Hermes so a changed core setting is re-read.
+
+    Hermes reads `allow_private_urls` only at startup, so `allow-onion` finishes
+    the job by restarting it. No single command fits every deployment, so this
+    runs NET_EXITS_RESTART_CMD when set, else restarts a lone systemd --user
+    service whose name holds "hermes", else hands back the command to run.
+    """
+    override = (os.environ.get(RESTART_CMD_ENV) or "").strip()
+    if override:
+        try:
+            subprocess.run(shlex.split(override), check=True, timeout=120)
+            return f"Hermes restarted ({RESTART_CMD_ENV})."
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            return (
+                f"could not restart Hermes with {RESTART_CMD_ENV} ({exc}); restart it "
+                "yourself for the change to take effect"
+            )
+    systemctl = shutil.which("systemctl")
+    if systemctl:
+        try:
+            listed = subprocess.run(
+                [systemctl, "--user", "list-units", "--type=service", "--no-legend", "--plain"],
+                capture_output=True, text=True, timeout=15,
+            )
+            units = [line.split()[0] for line in listed.stdout.splitlines()
+                     if line.split() and "hermes" in line.split()[0]]
+        except (subprocess.SubprocessError, OSError):
+            units = []
+        if len(units) == 1:
+            try:
+                subprocess.run([systemctl, "--user", "restart", units[0]], check=True, timeout=120)
+                return f"Hermes restarted ({units[0]})."
+            except (subprocess.SubprocessError, OSError) as exc:
+                return f"could not restart {units[0]} ({exc}); restart Hermes yourself"
+        if len(units) > 1:
+            return (
+                "several Hermes services are running (" + ", ".join(units)
+                + "); set " + RESTART_CMD_ENV + " or restart the right one yourself"
+            )
+    return (
+        "now restart Hermes yourself for the change to take effect (e.g. `systemctl --user "
+        "restart hermes-gateway`, or your container/process); set " + RESTART_CMD_ENV
+        + " so this command can do it next time"
+    )
 
 
 #: `-x`, by process name, and never `-f`: with `-f` the pattern is matched
@@ -3519,12 +3667,6 @@ def enter_tor_mode(javascript: bool = False) -> list[str]:
         )
     elif not javascript:
         done.append("JavaScript is off for the host browser")
-    # The state first, and only then the setting it accounts for. The other
-    # order left a window -- a failed state write, a crash, an OOM kill --
-    # where the config said `allow_private_urls` while the mode said off: so
-    # Hermes' own refusal of internal addresses was gone and the substitute
-    # in this plugin never ran. Both guards down, and the agent told that
-    # nothing had happened.
     # Remember the exit this was on, so `tor --off` can go back to it rather
     # than leave the browser on the Tor exit with the mode gone.
     prior = (saved_choice() or {}).get("name") or ""
@@ -3532,10 +3674,13 @@ def enter_tor_mode(javascript: bool = False) -> list[str]:
         tor_mode={"on": True, "javascript": bool(javascript), "at": int(time.time())},
         before_tor=prior,
     )
-    problem = _set_private_urls(True)
-    done.append(
-        problem or "the browser may now be sent to an address that resolves only through Tor"
-    )
+    # The plugin never turns off Hermes' refusal of non-resolving addresses:
+    # that is a person's call. If they have allowed private URLs, onion names
+    # can resolve; if not, say what to set and the guard keeps refusing them.
+    if private_urls_allowed():
+        done.append("the browser may be sent to an address that resolves only through Tor")
+    else:
+        done.append(_private_urls_todo())
     if not sandbox:
         shutil.rmtree(TOR_PROFILE_DIR, ignore_errors=True)
         _reapply_browser_args()
@@ -3544,18 +3689,8 @@ def enter_tor_mode(javascript: bool = False) -> list[str]:
 
 
 def leave_tor_mode() -> list[str]:
-    """Undo all of it, and clear the identity on the way out as well.
-
-    It also runs when the mode looks off but the config still carries the
-    line the mode writes, which is what a crash between the two leaves
-    behind. `doctor` prescribes this as the cure; returning early on the
-    state alone made the prescription a no-op.
-    """
-    # The marker, not the setting: it is what says a line is ours. Keying
-    # this on the setting meant that someone who had turned private URLs on
-    # themselves got their cookies cleared and their browser restarted by a
-    # plain `net_use direct`, which also calls this.
-    if not tor_mode() and PRIVATE_URLS_MARK not in _read_profile_config():
+    """Undo all of it, and clear the identity on the way out as well."""
+    if not tor_mode():
         return []
     sandbox = in_sandbox()
     done = [_clear_browsing_identity(sandbox)]
@@ -3565,8 +3700,14 @@ def leave_tor_mode() -> list[str]:
     else:
         shutil.rmtree(TOR_PROFILE_DIR, ignore_errors=True)
         done.append("the Tor profile was deleted")
-    problem = _set_private_urls(False)
-    done.append(problem or "the browser is back to refusing an address that does not resolve")
+    # The plugin does not touch `allow_private_urls`: a person set it, a
+    # person removes it. If it is still on, say so, since Hermes keeps
+    # allowing internal addresses until it is removed and Hermes restarts.
+    if private_urls_allowed():
+        done.append(
+            "your config still has `allow_private_urls: true`, so Hermes keeps allowing "
+            "internal addresses until you remove it and restart"
+        )
     _write_state(tor_mode={"on": False, "at": int(time.time())}, before_tor="")
     if not sandbox:
         shutil.rmtree(TOR_PROFILE_DIR, ignore_errors=True)
@@ -4025,26 +4166,24 @@ def doctor() -> tuple[bool, str]:
                 )
 
     mode = tor_mode()
-    if mode:
+    if mode and private_urls_allowed():
         good.append(
             "✓ Tor mode: the browser has a cleared profile"
             + (", JavaScript is off" if not mode.get("javascript") else ", JavaScript is on")
-            + ", and internal addresses are refused by this plugin instead of by Hermes"
+            + ", and because the config allows private URLs, internal addresses are "
+            "refused by this plugin instead of by Hermes"
+        )
+    elif mode:
+        bad.append(
+            "✗ Tor mode is on but the config does not allow private URLs, so Hermes still "
+            "refuses onion addresses. Run `hermes vpn allow-onion` (it restarts Hermes for "
+            "you) to open onion names"
         )
     elif private_urls_allowed():
-        # The setting, not the marker: the risk is that Hermes is not
-        # refusing internal addresses, and that is true whoever wrote the
-        # line. Whether it is ours decides the advice, not the finding.
-        ours = PRIVATE_URLS_MARK in _read_profile_config()
         bad.append(
             f"✗ Tor mode is off and {profile_config()} still allows private URLs, so Hermes "
-            "is not refusing internal addresses"
-            + (
-                " from when the mode was on — `hermes vpn tor --off` takes the line out"
-                if ours else
-                ". This plugin did not write that line, so it will not remove it: take it "
-                "out by hand unless you meant it"
-            )
+            "is not refusing internal addresses. Undo it with `hermes vpn allow-onion --off` "
+            "(it restarts Hermes) unless you meant it"
         )
 
     last_move = (_read_state() or {}).get("last_failover")

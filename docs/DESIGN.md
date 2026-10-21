@@ -142,8 +142,11 @@ falls back to whatever the gateway's environment says. For a floor that survives
 even that, set the dead end in `~/.hermes/.env`:
 
 ```
-AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage,--proxy-server=http://127.0.0.1:1
+AGENT_BROWSER_ARGS=--proxy-server=http://127.0.0.1:1
 ```
+
+(Only the dead-end proxy is needed: Hermes keeps its own browser flags, the
+sandbox bypass included, and this plugin only ever appends to this variable.)
 
 Then the worst case is a browser that cannot reach anything, rather than one
 quietly using the server's own address.
@@ -385,7 +388,7 @@ One container per country, each publishing its proxy **on loopback**:
 ```yaml
 services:
   mx:
-    image: qmcgaw/gluetun:latest
+    image: qmcgaw/gluetun:latest   # pin to a digest in production, e.g. qmcgaw/gluetun@sha256:...
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun:/dev/net/tun"]
     environment:
@@ -576,15 +579,21 @@ and then the page opens, on a circuit that already exists.
   profile's `config.yaml`, off by default. Turning it on lets the onion
   through and also stops the browser tool refusing loopback and LAN addresses
   in that profile, keeping only the cloud-metadata floor. That is a real
-  trade, so Tor mode makes it only for as long as the mode lasts: the line
-  goes in under a marker comment when the mode starts, comes out when it
-  ends, and the guard in this plugin refuses internal addresses in the
-  meantime. The config is copied to a timestamped `.bak-` beside it first,
-  with the original's permissions.
+  trade, and disabling a core security guard is a person's decision, not a
+  model tool's: **no tool writes that line.** The edit is a terminal command
+  a person runs, `hermes vpn allow-onion` (and `--off` to undo it). It explains
+  the change, asks the person to confirm, sets the line safely, and restarts
+  Hermes itself so it takes effect -- Hermes caches the setting until a restart.
+  The restart runs `NET_EXITS_RESTART_CMD` when set, otherwise a lone systemd
+  `--user` service whose name holds `hermes`, otherwise it prints the command to
+  run. Entering Tor mode, the onion guard and `net_doctor` all hand back that
+  same `allow-onion` command; until it is run, onion names stay refused. Whenever
+  the setting is on -- however it got there -- the guard in this plugin refuses
+  internal addresses in Hermes' place.
 
-  An `allow_private_urls` with no marker above it is somebody's own setting.
-  Nothing here removes one: `doctor` reports that the browser is reachable
-  from its own host and says to take the line out by hand.
+  `net_doctor` reports when Tor mode is on without it (onion names will not
+  resolve) and when it is left on with the mode off (the browser is reachable
+  from its own host), pointing at `allow-onion` / `--off` and a restart.
 - **Some sites want JavaScript and say so rudely.** Measured through this
   exit, same browser, same circuit: `example.com` and
   `check.torproject.org` load with JavaScript off, and DuckDuckGo's onion

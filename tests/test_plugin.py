@@ -287,7 +287,7 @@ class TheCliReportsFailure(_Base):
 
 
 class EveryToolHandlerIsReachable(_Base):
-    """None of the fifteen handlers had ever been called.
+    """None of the fourteen handlers had ever been called.
 
     They are what the model talks to -- the CLI deliberately bypasses them -- so
     a rename in `netexits` that the CLI does not use becomes an AttributeError
@@ -370,10 +370,10 @@ class ThePluginLoads(_Base):
         def register_cli_command(self, **kwargs):
             self.commands.append(kwargs)
 
-    def test_it_registers_the_fifteen_tools_the_middleware_and_the_command(self) -> None:
+    def test_it_registers_the_fourteen_tools_the_middleware_and_the_command(self) -> None:
         ctx = self._Ctx()
         plugin.register(ctx)
-        self.assertEqual(len(ctx.tools), 15)
+        self.assertEqual(len(ctx.tools), 14)
         self.assertEqual([k for k, _fn in ctx.middleware], ["tool_execution"])
         self.assertEqual([c["name"] for c in ctx.commands], ["vpn"])
         for tool in ctx.tools:
@@ -389,7 +389,7 @@ class ThePluginLoads(_Base):
             plugin.register(ctx)          # must not raise
         finally:
             netexits.reapply_saved_choice = real
-        self.assertEqual(len(ctx.tools), 15)
+        self.assertEqual(len(ctx.tools), 14)
 
 
 class TheSuiteCannotCutItselfInHalf(unittest.TestCase):
@@ -620,7 +620,7 @@ class TheSetupWizard(_Base):
 class TheVaultReferencePath(_Base):
     """Adding a provider from a reference, so the key never reaches the model."""
 
-    def run_cli(self, *argv: str) -> tuple[int, str]:
+    def run_cli(self, *argv: str, tty: bool = True, answer: str = "yes") -> tuple[int, str]:
         import argparse
         import contextlib
         import io
@@ -629,48 +629,50 @@ class TheVaultReferencePath(_Base):
         plugin._setup_cli(parser)
         args = parser.parse_args(argv)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        fake_stdin = mock.MagicMock()
+        fake_stdin.isatty.return_value = tty
+        with contextlib.redirect_stdout(out), \
+             mock.patch("sys.stdin", fake_stdin), \
+             mock.patch("builtins.input", return_value=answer):
             code = plugin._handle_cli(args)
         return code, out.getvalue()
 
-    def test_the_tool_is_registered(self) -> None:
+    def test_there_is_no_model_tool_for_it(self) -> None:
+        """Credential entry is CLI-only: the agent has no tool that adds a
+        provider, so it cannot be talked into driving credential entry."""
         ctx = ThePluginLoads._Ctx()
         plugin.register(ctx)
         names = [t["name"] for t in ctx.tools]
-        self.assertIn("net_add_provider", names)
+        self.assertNotIn("net_add_provider", names)
+        self.assertFalse(hasattr(plugin, "handle_add_provider"))
 
-    def test_the_handler_routes_to_the_reference_path(self) -> None:
-        calls: list[tuple[str, str]] = []
-        with mock.patch.object(
-            netexits, "add_provider_from_ref",
-            side_effect=lambda p, r: calls.append((p, r)) or "stored credentials for airvpn",
-        ):
-            said = plugin.handle_add_provider(
-                {"provider": "airvpn", "secret_ref": "pass:vpn/airvpn"}
-            )
-        self.assertEqual(calls, [("airvpn", "pass:vpn/airvpn")])
-        self.assertIn("airvpn", said)
-
-    def test_the_handler_wraps_a_failure_in_a_sentence(self) -> None:
-        with mock.patch.object(
-            netexits, "add_provider_from_ref",
-            side_effect=netexits.ExitError("env: is not a vault"),
-        ):
-            said = plugin.handle_add_provider(
-                {"provider": "airvpn", "secret_ref": "env:KEY"}
-            )
-        self.assertIn("Could not add that provider", said)
-
-    def test_the_cli_from_ref_routes_to_the_reference_path(self) -> None:
+    def test_the_cli_from_ref_explains_then_writes_on_yes(self) -> None:
         calls: list[tuple[str, str]] = []
         with mock.patch.object(
             netexits, "add_provider_from_ref",
             side_effect=lambda p, r: calls.append((p, r)) or "done",
         ):
-            code, said = self.run_cli("provider", "airvpn", "--from-ref", "pass:vpn/airvpn")
+            code, said = self.run_cli("provider", "airvpn", "--from-ref", "pass:vpn/airvpn",
+                                      answer="yes")
         self.assertEqual(code, 0)
         self.assertEqual(calls, [("airvpn", "pass:vpn/airvpn")])
+        self.assertIn("root-only", said, "the explanation is shown first")
         self.assertIn("done", said)
+
+    def test_the_cli_from_ref_aborts_unless_confirmed(self) -> None:
+        with mock.patch.object(netexits, "add_provider_from_ref") as m:
+            code, said = self.run_cli("provider", "airvpn", "--from-ref", "pass:vpn/airvpn",
+                                      answer="n")
+        self.assertEqual(code, 0)
+        m.assert_not_called()
+        self.assertIn("unchanged", said.lower())
+
+    def test_the_cli_from_ref_refuses_without_a_terminal(self) -> None:
+        with mock.patch.object(netexits, "add_provider_from_ref") as m:
+            code, _said = self.run_cli("provider", "airvpn", "--from-ref", "pass:vpn/airvpn",
+                                       tty=False)
+        self.assertEqual(code, 1)
+        m.assert_not_called()
 
 
 class ToolsNeverRaiseToTheChat(_Base):
@@ -696,6 +698,88 @@ class ToolsNeverRaiseToTheChat(_Base):
         for tool in ctx.tools:
             self.assertTrue(callable(tool["handler"]))
 
+
+
+class TheAllowOnionCommand(unittest.TestCase):
+    """`hermes vpn allow-onion` is the human, CLI-only way to let the browser
+    open .onion addresses. It turns off a core security guard, so it explains
+    what it will do and asks before doing it. There is no model tool for it."""
+
+    def run_cli(self, *argv: str, tty: bool = True, answer: str = "yes") -> tuple[int, str]:
+        import argparse
+        import contextlib
+        import io
+        parser = argparse.ArgumentParser(prog="vpn")
+        plugin._setup_cli(parser)
+        args = parser.parse_args(argv)
+        out = io.StringIO()
+        fake_stdin = mock.MagicMock()
+        fake_stdin.isatty.return_value = tty
+        with contextlib.redirect_stdout(out), \
+             mock.patch("sys.stdin", fake_stdin), \
+             mock.patch("builtins.input", return_value=answer), \
+             mock.patch.object(netexits, "restart_hermes", return_value="Hermes restarted (stub)."):
+            code = plugin._handle_cli(args)
+        return code, out.getvalue()
+
+    def test_enabling_explains_then_writes_and_restarts_on_yes(self) -> None:
+        with mock.patch.object(netexits, "allow_onion", return_value=(True, "written")) as m:
+            code, said = self.run_cli("allow-onion", answer="yes")
+        self.assertEqual(code, 0)
+        m.assert_called_once_with(True)
+        self.assertIn("SSRF", said, "the explanation is shown before the change")
+        self.assertIn("written", said)
+        self.assertIn("Hermes restarted", said, "it restarts Hermes itself when it changed")
+
+    def test_enabling_does_not_restart_when_nothing_changed(self) -> None:
+        """Running it twice must not bounce a live agent for nothing."""
+        with mock.patch.object(netexits, "allow_onion", return_value=(False, "already set")):
+            code, said = self.run_cli("allow-onion", answer="yes")
+        self.assertEqual(code, 0)
+        self.assertIn("No change", said)
+        self.assertNotIn("Hermes restarted", said)
+
+    def test_enabling_is_aborted_unless_the_word_is_typed(self) -> None:
+        with mock.patch.object(netexits, "allow_onion") as m:
+            code, said = self.run_cli("allow-onion", answer="y")  # not the full word
+        self.assertEqual(code, 0)
+        m.assert_not_called()
+        self.assertIn("unchanged", said.lower())
+
+    def test_enabling_refuses_without_a_terminal(self) -> None:
+        with mock.patch.object(netexits, "allow_onion") as m:
+            code, said = self.run_cli("allow-onion", tty=False)
+        self.assertEqual(code, 1)
+        m.assert_not_called()
+        self.assertIn("terminal", said.lower())
+
+    def test_off_also_explains_confirms_and_restarts(self) -> None:
+        """--off restarts Hermes too (dropping sessions), so it is not silent."""
+        with mock.patch.object(netexits, "allow_onion", return_value=(True, "off")) as m:
+            code, said = self.run_cli("allow-onion", "--off", answer="yes")
+        self.assertEqual(code, 0)
+        m.assert_called_once_with(False)
+        self.assertIn("internal addresses", said, "the --off plan is shown")
+        self.assertIn("Hermes restarted", said)
+
+    def test_off_refuses_without_a_terminal(self) -> None:
+        with mock.patch.object(netexits, "allow_onion") as m:
+            code, _said = self.run_cli("allow-onion", "--off", tty=False)
+        self.assertEqual(code, 1)
+        m.assert_not_called()
+
+    def test_off_aborts_unless_confirmed(self) -> None:
+        with mock.patch.object(netexits, "allow_onion") as m:
+            code, said = self.run_cli("allow-onion", "--off", answer="n")
+        self.assertEqual(code, 0)
+        m.assert_not_called()
+        self.assertIn("unchanged", said.lower())
+
+    def test_it_is_not_a_model_tool(self) -> None:
+        ctx = ThePluginLoads._Ctx()
+        plugin.register(ctx)
+        self.assertNotIn("allow-onion", [t["name"] for t in ctx.tools])
+        self.assertNotIn("net_allow_onion", [t["name"] for t in ctx.tools])
 
 
 if __name__ == "__main__":
