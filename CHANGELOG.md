@@ -6,6 +6,33 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: every tool is `vpn_*` instead of `net_*`.** `net_exits` is
+  `vpn_exits`, `net_use` is `vpn_use`, and so on for all fourteen. The names
+  were never only ours: geobrowse is an MCP browser server grown from this same
+  code, it serves `net_exits`, `net_use`, `net_where` and the rest -- one set
+  per browser it runs -- and on a host running both, one agent had two of each
+  in reach. Worse, both families described what they moved as "the agent's
+  browser", which is true of both and tells them apart for neither.
+
+  It was measured rather than imagined: asked in Spanish to browse from Mexico,
+  the agent called this family, moved the bot's own sandbox, read Madrid back
+  from ipinfo and only noticed on the second look. It could as easily have
+  answered Madrid.
+
+  So the tools are renamed, and the descriptions carry the distinction instead
+  of leaving an agent to guess. The seven that really move an exit open with
+  what they move -- "Moves THIS BOT'S OWN network" -- and all fourteen end by
+  naming the other family and what it is for. Both sentences are appended in
+  one loop over `TOOLS` rather than typed into fourteen descriptions, so a tool
+  added later cannot be registered without them; a test asserts that, and that
+  no tool is named `net_*` any more. `vpn_places` and the other tools that only
+  answer questions do not claim to move anything, because they do not.
+
+  The CLI is unchanged: it was always `hermes vpn ...`, which is where the new
+  prefix comes from.
+
 ## [0.3.0] - 2026-10-21
 
 ### Changed (plugin-catalog review)

@@ -14,17 +14,17 @@ It adds **no tunnel and no dependency**. An *exit* is just a local proxy, so any
 
 | Tool | What it does |
 |---|---|
-| `net_use` | switch to an exit, checked first, then applied, then verified |
-| `net_exits` | the exits available, and which one is in use |
-| `net_where` | where the browser appears to be right now, by asking |
-| `net_places` | which countries and cities a provider offers, for **any** provider gluetun knows |
-| `net_open` / `net_close` | bring up an exit in a place that has none yet, and shut it down again |
-| `net_lock` | the kill switch: browse by an exit, or not at all |
-| `net_failover` | name a standby exit and let a dead one be swapped for it (off by default) |
-| `net_tor_connect` / `net_new_circuit` | enter Tor as a mode, and ask for a fresh circuit |
-| `net_providers` / `net_provider_setup` | which VPNs have credentials here, and what each one needs |
-| `net_harden` | install the browser-wide WebRTC policy so the protection cannot be lost |
-| `net_doctor` | what is protecting this browsing and what is not, with the fix for each gap |
+| `vpn_use` | switch to an exit, checked first, then applied, then verified |
+| `vpn_exits` | the exits available, and which one is in use |
+| `vpn_where` | where the browser appears to be right now, by asking |
+| `vpn_places` | which countries and cities a provider offers, for **any** provider gluetun knows |
+| `vpn_open` / `vpn_close` | bring up an exit in a place that has none yet, and shut it down again |
+| `vpn_lock` | the kill switch: browse by an exit, or not at all |
+| `vpn_failover` | name a standby exit and let a dead one be swapped for it (off by default) |
+| `vpn_tor_connect` / `vpn_new_circuit` | enter Tor as a mode, and ask for a fresh circuit |
+| `vpn_providers` / `vpn_provider_setup` | which VPNs have credentials here, and what each one needs |
+| `vpn_harden` | install the browser-wide WebRTC policy so the protection cannot be lost |
+| `vpn_doctor` | what is protecting this browsing and what is not, with the fix for each gap |
 
 **Verified end-to-end on a live server:** a running bot's sandbox migrated onto a VPN exit without a restart, Tor mode entered and left, and the browser returned to its previous country, each step confirmed by reading the address back from *inside* the sandbox.
 
@@ -165,7 +165,7 @@ Be honest about what that buys. The scripts in `contrib/` ship **without a file 
 These are the edges that selecting an exit does not close on its own. None is left as a silent gap — each is named here with what the plugin does about it:
 
 - **WebRTC** is the one leak a proxy cannot catch: a proxy carries only TCP, so WebRTC's UDP would otherwise carry the host's real address straight past it. So whenever an exit is selected the browser is told to disable non-proxied UDP, `hermes vpn harden` makes that a browser-wide policy so it holds even if the browser is relaunched, and [`webrtc-leak-test.py`](webrtc-leak-test.py) measures it rather than trusting it. For a floor that survives even the plugin failing to load, set a dead-end proxy in `AGENT_BROWSER_ARGS`.
-- **Labels can lie.** `SERVER_COUNTRIES: Mexico` is what you asked gluetun for, not proof. Only `net_where` is evidence.
+- **Labels can lie.** `SERVER_COUNTRIES: Mexico` is what you asked gluetun for, not proof. Only `vpn_where` is evidence.
 - **This is not Tor Browser.** Tor mode gives a Tor exit and a clean session, not Tor Browser's anonymity set. A site that fingerprints the browser can still tell visitors apart.
 
 Each of these, and the reasoning behind every choice above, is covered in full in **[DESIGN.md](docs/DESIGN.md)**.

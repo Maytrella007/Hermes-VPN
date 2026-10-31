@@ -458,7 +458,7 @@ def resolve(selector: str) -> Exit:
     names = ", ".join(c.label for c in exits)
     raise ExitError(
         f"no exit matches {selector!r}; available: {names}. To create one for a place that "
-        "has none, use net_open (`hermes vpn open <place>`)"
+        "has none, use vpn_open (`hermes vpn open <place>`)"
     )
 
 
@@ -865,7 +865,7 @@ def set_standby(name: str) -> str:
         raise ExitError(
             "Tor is not a standby. Failover does not enter Tor mode, so it would put the "
             "browser on Tor carrying the cookies of the ordinary session, which is the "
-            "linkage Tor mode exists to break. `net_tor_connect` is how to use it, "
+            "linkage Tor mode exists to break. `vpn_tor_connect` is how to use it, "
             "deliberately."
         )
     in_use = _exit_in_use()
@@ -920,8 +920,8 @@ def set_failover(value: bool) -> str:
                 f"{where}Nothing is armed yet: a standby has to be chosen first. You have "
                 + ", ".join(others)
                 + " configured besides it. Ask which city or country the standby should "
-                "come out of — `net_places` lists what a provider offers — then open it "
-                "with net_open and name it with net_failover again."
+                "come out of — `vpn_places` lists what a provider offers — then open it "
+                "with vpn_open and name it with vpn_failover again."
             )
         return (
             f"{where}Nothing is armed yet, and the only provider configured here is the one "
@@ -1073,7 +1073,7 @@ def _attempt_failover(dead_name: str, dead_country: str, *, sandbox: str = "") -
     if not chosen:
         return False, (
             " Failover is armed but no standby exit has been chosen, so there is nowhere "
-            "to go — `net_failover` with a place picks one on another provider."
+            "to go — `vpn_failover` with a place picks one on another provider."
         )
     blocked = _failover_blocked_by_cooldown()
     if blocked:
@@ -1191,7 +1191,7 @@ def guard_browser(tool_name: str, call_args: Any = None) -> str:
             f"Held: {onion} is an onion address, and Hermes still refuses addresses that "
             "do not resolve on this machine. In a terminal run `hermes vpn allow-onion` "
             "(it confirms, sets the config and restarts Hermes for you); then "
-            "`net_tor_connect` can open onion names."
+            "`vpn_tor_connect` can open onion names."
         )
     if onion and _onion_is_warm(onion):
         # The browser is about to use it, which is better evidence than the
@@ -1206,7 +1206,7 @@ def guard_browser(tool_name: str, call_args: Any = None) -> str:
         if here is None or (current_proxy() != here.proxy and not in_sandbox()):
             return (
                 f"Held: {onion} is an onion address and this browser is not going through "
-                "Tor, so the name cannot resolve at all. `net_tor_connect` with that "
+                "Tor, so the name cannot resolve at all. `vpn_tor_connect` with that "
                 "address switches to the Tor exit, waits for the circuit and says when it "
                 "is up."
             )
@@ -1215,14 +1215,14 @@ def guard_browser(tool_name: str, call_args: Any = None) -> str:
             return (
                 f"Held: the circuit to {onion} was last confirmed more than "
                 f"{ONION_WARM_SECONDS // 60} minutes ago, and this plugin does not know "
-                "whether it is still up. `net_tor_connect` with that address checks in a "
+                "whether it is still up. `vpn_tor_connect` with that address checks in a "
                 "second or two if it is, and waits if it is not — cheaper than the minute "
                 "the browser would spend timing out."
             )
         return (
             f"Held: nothing has reached {onion} through Tor yet, and a first connection to "
             "an onion service can take a minute — long enough that the browser would give "
-            "up and report it as a broken site. Call `net_tor_connect` with that address "
+            "up and report it as a broken site. Call `vpn_tor_connect` with that address "
             "first; it waits for the circuit and says when the page can be opened."
         )
 
@@ -1582,7 +1582,7 @@ def _tor_without_the_mode(target: Exit) -> str:
     return (
         " This is the Tor exit, but Tor mode is off: the browser keeps the cookies and the "
         "session it already had, JavaScript is on, and an onion name still will not "
-        "resolve. `net_tor_connect` is the way to use Tor properly — it clears the session "
+        "resolve. `vpn_tor_connect` is the way to use Tor properly — it clears the session "
         "first and waits for the circuit."
     )
 
@@ -1607,7 +1607,7 @@ def switch(selector: str, *, restart: bool = True) -> str:
             raise ExitError(
                 "the kill switch is armed, so the browser may not leave directly. Disarm it "
                 "first if that is really what you want: `hermes vpn lock --off`, or "
-                "net_lock with armed=false."
+                "vpn_lock with armed=false."
             )
         leave_tor_mode()
         apply(None)
@@ -1704,7 +1704,7 @@ HELPER_FLAGS = frozenset({"--city", "--provider"})
 #: A positional helper argument: a verb, an exit name, a place or a profile.
 #: Unicode letters are allowed because gluetun's own place names include
 #: Zürich and São Paulo, which the helper accepts under a UTF-8 locale and
-#: `net_places` prints verbatim; the ASCII-only version refused them before
+#: `vpn_places` prints verbatim; the ASCII-only version refused them before
 #: the helper ever saw them. It must not begin with a dash (the helper would
 #: read it as an option) or a space, holds no control character, and is long
 #: enough for the longest name the helper mints: `exit-` + a 31-char provider
@@ -1890,7 +1890,7 @@ def guides() -> list[str]:
 #: Sections of the shipped gluetun wiki page a plugin user does not need, dropped
 #: from what `guide()` prints. The TLDR is docker/compose commands that OMIT the
 #: HTTPPROXY/loopback settings this plugin requires, so copying it misleads; the
-#: server list is long and `net_places` answers it.
+#: server list is long and `vpn_places` answers it.
 _GUIDE_DROP_SECTIONS = {"tldr", "servers"}
 
 
@@ -2127,7 +2127,7 @@ def open_sandbox(container: str, direct: bool) -> str:
     else. It deliberately does not move the browser off the exit it is on --
     disarming while a healthy tunnel is selected should not take anyone out
     of it, and an earlier draft of this did exactly that. Going direct is
-    `net_use direct`, the same two steps the host has always had.
+    `vpn_use direct`, the same two steps the host has always had.
 
     Arming puts the exit's proxy back in the policy and seals the sandbox.
     """
@@ -2562,7 +2562,7 @@ def configured_providers() -> list[tuple[str, str]]:
         # reader and have completely different fixes.
         raise ExitError(f"the exit helper could not be asked: {exc}") from exc
     # (provider name, file it came from). `--provider` takes the second one,
-    # so report both or we name something `net_open` will reject.
+    # so report both or we name something `vpn_open` will reject.
     found = []
     for line in said.splitlines():
         if not line.strip():
@@ -3735,10 +3735,10 @@ def end_tor_mode() -> str:
         except ExitError as exc:
             note += (
                 f" The exit from before Tor ({prior}) could not be restored ({exc}); "
-                "choose one with net_use."
+                "choose one with vpn_use."
             )
     else:
-        note += " Choose an exit with net_use."
+        note += " Choose an exit with vpn_use."
     return note
 
 
@@ -3756,7 +3756,7 @@ def set_tor_javascript(enabled: bool) -> str:
     if not mode:
         raise ExitError(
             "Tor mode is not on, so there is no Tor JavaScript setting to change. "
-            "net_tor_connect enters it, with JavaScript off unless you ask for it."
+            "vpn_tor_connect enters it, with JavaScript off unless you ask for it."
         )
     if bool(mode.get("javascript")) == bool(enabled):
         return f"JavaScript is already {'on' if enabled else 'off'} in Tor mode; nothing changed."
@@ -3780,7 +3780,7 @@ def set_tor_javascript(enabled: bool) -> str:
             "JavaScript is on in Tor mode now, at your request. The browser was closed so the "
             "next page loads with it, and your Tor session was kept. This hands back the surface "
             "the mode turns off -- fingerprinting, the local network, whatever a page runs -- so "
-            "turn it off again (net_tor_connect javascript=false, or `hermes vpn tor "
+            "turn it off again (vpn_tor_connect javascript=false, or `hermes vpn tor "
             "--no-javascript`) once the site that needed it is done."
         )
     return (
@@ -3911,7 +3911,7 @@ def new_circuit(selector: str = "") -> str:
     target = resolve(selector) if selector.strip() else _exit_in_use()
     if target is None:
         raise ExitError(
-            "no exit is in use, so there is no circuit to change. `net_tor_connect` first, "
+            "no exit is in use, so there is no circuit to change. `vpn_tor_connect` first, "
             "or name an exit."
         )
     if target.provider != TOR_PROVIDER:
@@ -3983,7 +3983,7 @@ def _exit_in_use() -> Exit | None:
     The name first, and in a sandbox the name only. The host's proxy is a
     value that means nothing to a browser reading a managed policy, and
     matching on it picked whichever exit happened to hold a stale address:
-    `net_new_circuit` with nothing named went to the Mexican exit while the
+    `vpn_new_circuit` with nothing named went to the Mexican exit while the
     sandbox was out through Tor. Third time this value has answered for a
     browser that never reads it, after `list` and `doctor`.
     """
@@ -4521,7 +4521,7 @@ def why_no_exits() -> str:
         )
     return (
         "No exits available yet. `hermes vpn open <country>` brings one up when the helper "
-        "and credentials are installed, `net_providers` says whether they are, and "
+        "and credentials are installed, `vpn_providers` says whether they are, and "
         f"`hermes vpn doctor` checks the rest. An exit of your own goes in {exits_file()}."
     )
 
@@ -4553,7 +4553,7 @@ def describe_exits() -> str:
     if sandbox and not chosen:
         lines.append(
             f"- no exit chosen for the sandbox {sandbox}: with the kill switch disarmed its "
-            "browser leaves by this host's own address, and `net_where` measures it"
+            "browser leaves by this host's own address, and `vpn_where` measures it"
             if not locked() else
             f"- none chosen yet for the sandbox {sandbox}, and the kill switch is armed, so "
             "it is not browsing at all"

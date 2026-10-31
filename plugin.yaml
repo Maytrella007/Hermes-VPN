@@ -15,20 +15,20 @@ kind: standalone
 platforms:
   - linux
 provides_tools:
-  - net_exits
-  - net_use
-  - net_where
-  - net_harden
-  - net_places
-  - net_lock
-  - net_failover
-  - net_tor_connect
-  - net_new_circuit
-  - net_doctor
-  - net_providers
-  - net_provider_setup
-  - net_open
-  - net_close
+  - vpn_exits
+  - vpn_use
+  - vpn_where
+  - vpn_harden
+  - vpn_places
+  - vpn_lock
+  - vpn_failover
+  - vpn_tor_connect
+  - vpn_new_circuit
+  - vpn_doctor
+  - vpn_providers
+  - vpn_provider_setup
+  - vpn_open
+  - vpn_close
 provides_middleware:
   - tool_execution
 provides_cli:

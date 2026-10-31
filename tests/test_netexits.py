@@ -764,7 +764,7 @@ class KillSwitch(_Sandbox):
     def test_other_tools_are_never_held(self) -> None:
         netexits.set_locked(True)
         self._alive(False)
-        for tool in ("net_where", "write_file", "terminal"):
+        for tool in ("vpn_where", "write_file", "terminal"):
             self.assertEqual(netexits.guard_browser(tool), "")
 
     def test_the_check_is_cached_between_calls(self) -> None:
@@ -1742,7 +1742,7 @@ class OneRelayPerProfile(_Sandbox):
 
 
 class WhereDoesNotOverclaim(_Sandbox):
-    """`net_where` may only describe the topology it actually inspected."""
+    """`vpn_where` may only describe the topology it actually inspected."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -2023,7 +2023,7 @@ class TheCircuitIsConfirmedBeforeTheBrowserMoves(_Sandbox):
         netexits.apply(self.tor)
         held = netexits.guard_browser("browser_navigate", {"url": f"https://{self.ONION}/"})
         self.assertIn("Held", held)
-        self.assertIn("net_tor_connect", held)
+        self.assertIn("vpn_tor_connect", held)
 
     def test_and_let_through_once_it_has(self) -> None:
         netexits.apply(self.tor)
@@ -2471,7 +2471,7 @@ class TheTorExitWithoutTheMode(_Sandbox):
 
     The README calls it theatre: the session that was there is still there,
     and a site that recognises it knows who it is talking to whatever
-    address the request arrived from. A model reading `net_use`'s
+    address the request arrived from. A model reading `vpn_use`'s
     description will reach for it, and the plugin's own `new_circuit` error
     used to point at it.
     """
@@ -2492,7 +2492,7 @@ class TheTorExitWithoutTheMode(_Sandbox):
     def test_switching_to_it_says_what_is_missing(self) -> None:
         said = netexits.switch("exit-tor")
         self.assertIn("Tor mode is off", said)
-        self.assertIn("net_tor_connect", said)
+        self.assertIn("vpn_tor_connect", said)
 
     def test_the_sandbox_path_says_it_too(self) -> None:
         """It was added to the host path and the bots never saw it — the
@@ -2519,7 +2519,7 @@ class TheTorExitWithoutTheMode(_Sandbox):
         that gives the exit without the mode."""
         with self.assertRaises(netexits.ExitError) as caught:
             netexits.new_circuit()
-        self.assertIn("net_tor_connect", str(caught.exception))
+        self.assertIn("vpn_tor_connect", str(caught.exception))
         self.assertNotIn("vpn use tor", str(caught.exception))
 
 
@@ -2914,7 +2914,7 @@ class AskingTorForAnotherNode(_Sandbox):
         self.assertIn("coalesces", said)
 
     def test_with_nothing_named_it_asks_the_exit_this_profile_is_on(self) -> None:
-        """A bot hit this: `net_new_circuit` went to the Mexican exit while
+        """A bot hit this: `vpn_new_circuit` went to the Mexican exit while
         the sandbox was out through Tor, because the host's stale proxy
         matched it first. In a sandbox that value is not the browser's."""
         netexits.in_sandbox = lambda: "hermes-box"
@@ -3226,7 +3226,7 @@ class FixesThatBrokeOtherThings(_Sandbox):
 
 
 class TheBrowserRestartIsNotAssumed(_Sandbox):
-    """`restart_browser` runs on every `net_use`, so test it there.
+    """`restart_browser` runs on every `vpn_use`, so test it there.
 
     It is the mechanism behind the plugin's only promise about an *already
     open* browser. When it silently does nothing, `switch` still reports the
@@ -3380,7 +3380,7 @@ class TheSandboxKillSwitchPath(_Sandbox):
         """Disarming permits going direct; it does not go direct.
 
         An earlier draft rewrote the policy on the way down, so asking to
-        lift a hold dropped a bot out of a healthy tunnel. `net_use direct`
+        lift a hold dropped a bot out of a healthy tunnel. `vpn_use direct`
         is the step that moves it, the same two steps the host has.
         """
         wrote: list = []
@@ -4332,7 +4332,7 @@ class TheConfigSurgeryIsOnSomeoneElsesFile(_Sandbox):
         self.assertIn("allow-onion --off", report)  # same advice, whoever wrote it
 
     def test_leaving_the_mode_does_not_touch_a_config_with_nothing_of_ours(self) -> None:
-        """`net_use direct` calls it unconditionally, and clearing someone's
+        """`vpn_use direct` calls it unconditionally, and clearing someone's
         cookies over a setting they made themselves is not its business."""
         self.config("browser:\n  allow_private_urls: true\n")
         self.assertEqual(netexits.leave_tor_mode(), [])

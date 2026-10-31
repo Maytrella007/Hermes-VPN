@@ -11,7 +11,7 @@ way its browser leaves — and know which way it actually got.
 > or a commercial proxy works exactly the same way.
 
 > **you:** browse from Mexico and open my site
-> **agent:** *(calls `net_use`)* Now leaving by mx (Mexico): seen as
+> **agent:** *(calls `vpn_use`)* Now leaving by mx (Mexico): seen as
 > 201.x.x.x (Mexico City), checked in 0.9s. Closed 1 browser process, so the
 > next page loads through it.
 
@@ -29,18 +29,18 @@ agent that can pick an exit and, more importantly, one that *knows where it is*.
 
 | Tool | What it does |
 |---|---|
-| `net_exits` | the exits available, and which one is in use |
-| `net_use` | switch to one — checked first, then applied, then verified |
-| `net_where` | where the browser appears to be *right now*, by asking |
-| `net_places` | which countries and cities a provider offers — **any** provider gluetun knows |
-| `net_harden` | install the browser-wide WebRTC policy, so the protection cannot be lost |
-| `net_providers` | which VPNs this host has credentials for, and which have setup guides |
-| `net_provider_setup` | what a given provider needs and where to find it, from a shipped guide |
-| `net_open` | bring up an exit in a place that has none yet, and switch to it |
-| `net_close` | shut one down again |
-| `net_lock` | the kill switch: browse by an exit, or not at all |
-| `net_failover` | off by default: name a standby exit and let a dead one be swapped for it |
-| `net_doctor` | what is protecting this browsing and what is not, with the fix for each gap |
+| `vpn_exits` | the exits available, and which one is in use |
+| `vpn_use` | switch to one — checked first, then applied, then verified |
+| `vpn_where` | where the browser appears to be *right now*, by asking |
+| `vpn_places` | which countries and cities a provider offers — **any** provider gluetun knows |
+| `vpn_harden` | install the browser-wide WebRTC policy, so the protection cannot be lost |
+| `vpn_providers` | which VPNs this host has credentials for, and which have setup guides |
+| `vpn_provider_setup` | what a given provider needs and where to find it, from a shipped guide |
+| `vpn_open` | bring up an exit in a place that has none yet, and switch to it |
+| `vpn_close` | shut one down again |
+| `vpn_lock` | the kill switch: browse by an exit, or not at all |
+| `vpn_failover` | off by default: name a standby exit and let a dead one be swapped for it |
+| `vpn_doctor` | what is protecting this browsing and what is not, with the fix for each gap |
 
 ## The kill switch
 
@@ -91,7 +91,7 @@ doing. Worth knowing before concluding the two disagree — and worth knowing
 when reading a measurement, which is why the one below is taken with
 `--noproxy`.
 
-While it is off the tunnel, `net_where` says so instead of reporting a
+While it is off the tunnel, `vpn_where` says so instead of reporting a
 location it could not confirm: the verifier measures *through the relay*, and
 there is nothing behind the relay in that state, so the question is put from
 inside the container directly. Still a measurement — reporting this host's
@@ -189,8 +189,8 @@ Four things it will not do:
 - **Use Tor.** Naming the Tor exit as a standby is refused, and the reason is
   the same one that makes Tor a mode: failover does not enter it, so it would
   put the browser on Tor carrying the cookies of the ordinary session, which
-  is the linkage Tor mode exists to break. `net_tor_connect` is how to use
-  Tor, deliberately — and selecting that exit with `net_use` has the same
+  is the linkage Tor mode exists to break. `vpn_tor_connect` is how to use
+  Tor, deliberately — and selecting that exit with `vpn_use` has the same
   problem, so it says so when you do.
 
 Three more things that are true of it. It **rides on the kill switch's
@@ -205,7 +205,7 @@ state file, and reported by `doctor`.
 A standby is chosen in front of one exit and outlives it, so every switch to
 another exit repeats which one it is. A different provider is worth
 preferring: when a whole place stops answering, the usual reason is the
-subscription behind it, and `net_providers` shows which VPNs this host has
+subscription behind it, and `vpn_providers` shows which VPNs this host has
 credentials for — adding one is the person's to do, with
 `hermes vpn provider <name>` printing what it needs and where, and the
 credentials never passing through the agent.
@@ -225,7 +225,7 @@ to be up is worse than no tunnel, because decisions get made on the belief.
 
 Chromium takes its proxy as a launch argument, so a change only applies to a
 new process. Hermes launches the browser on demand and lets it idle out, so
-usually there is nothing to close — but if a session has one open, `net_use`
+usually there is nothing to close — but if a session has one open, `vpn_use`
 closes it (politely, then firmly) and the next page load comes up on the new
 exit. The agent's own desktop and session stay up; only the browser blinks.
 
@@ -335,7 +335,7 @@ credentials.
 
 ## Exits on demand
 
-`net_use` picks among exits that are already running. To let the agent create
+`vpn_use` picks among exits that are already running. To let the agent create
 one for a place that has none — *"connect to a server in Miami"* — install the
 helper from [`contrib/vpn-exit`](../contrib/vpn-exit):
 
@@ -469,7 +469,7 @@ Three things worth knowing before using it:
 - **A site that refuses this node can be handed another one.**
 
   ```bash
-  hermes vpn circuit        # or net_new_circuit, on the exit in use
+  hermes vpn circuit        # or vpn_new_circuit, on the exit in use
   ```
 
   It signals Tor's control port from inside the container — the cookie never
@@ -477,7 +477,7 @@ Three things worth knowing before using it:
   same as a circuit that changed. Tor coalesces these within about ten
   seconds, so asking twice in a row honestly gives one new circuit, and the
   answer says so instead of claiming a move. It is refused on an exit that is
-  not Tor, where `net_use` is the right tool.
+  not Tor, where `vpn_use` is the right tool.
 
   Two readings can also differ with nobody asking: Tor builds a separate
   circuit per destination and rotates them on its own. What the tool
@@ -512,7 +512,7 @@ permissions are denied, and the password manager and autofill are off. Pass
 `--javascript` when a site needs it, and expect to be told.
 
 It can also be turned on, and off again, **without leaving the mode**. Once in
-Tor mode, `hermes vpn tor --javascript` (or `net_tor_connect` with
+Tor mode, `hermes vpn tor --javascript` (or `vpn_tor_connect` with
 `javascript: true`) flips it in place: the browser is closed so the next page
 reads the new setting, but the session is **kept**, not set aside, which is the
 difference from re-entering. `hermes vpn tor --no-javascript` puts it back.
@@ -550,7 +550,7 @@ hermes vpn tor                     # switch to Tor, check it is bootstrapped
 hermes vpn tor https://…onion/     # and establish the circuit to that service
 ```
 
-`net_tor_connect` is the tool behind it, and the order it imposes is the
+`vpn_tor_connect` is the tool behind it, and the order it imposes is the
 point. It switches to the Tor exit, reads Tor's own bootstrap state from the
 control port, and then fetches the address **from here, not from the
 browser**, with a timeout a rendezvous can actually use. Only when something
@@ -586,12 +586,12 @@ and then the page opens, on a circuit that already exists.
   Hermes itself so it takes effect -- Hermes caches the setting until a restart.
   The restart runs `NET_EXITS_RESTART_CMD` when set, otherwise a lone systemd
   `--user` service whose name holds `hermes`, otherwise it prints the command to
-  run. Entering Tor mode, the onion guard and `net_doctor` all hand back that
+  run. Entering Tor mode, the onion guard and `vpn_doctor` all hand back that
   same `allow-onion` command; until it is run, onion names stay refused. Whenever
   the setting is on -- however it got there -- the guard in this plugin refuses
   internal addresses in Hermes' place.
 
-  `net_doctor` reports when Tor mode is on without it (onion names will not
+  `vpn_doctor` reports when Tor mode is on without it (onion names will not
   resolve) and when it is left on with the mode off (the browser is reachable
   from its own host), pointing at `allow-onion` / `--off` and a restart.
 - **Some sites want JavaScript and say so rudely.** Measured through this
@@ -611,7 +611,7 @@ and then the page opens, on a circuit that already exists.
   load of an onion a minute or two; the ones after it are ordinary. An onion
   that is genuinely gone fails in about a second instead, the same way in
   curl and in the browser, so slow and dead do not look alike.
-- **The country changes with the circuit.** Two calls to `net_where` can report
+- **The country changes with the circuit.** Two calls to `vpn_where` can report
   two different addresses in two different places. That is Tor working, not a
   fault. Cloudflare's trace reports the country as `T1`, which is its code for
   a Tor exit.
@@ -656,7 +656,7 @@ they have not been tested together.
   while skipping it sends the browser out by the host's own address with nobody
   the wiser. Checking happens when a tool is used.
 - **Labels can lie.** `SERVER_COUNTRIES: Mexico` is what you asked gluetun for,
-  not proof. Only `net_where` is evidence.
+  not proof. Only `vpn_where` is evidence.
 
 ## Honest about intent
 

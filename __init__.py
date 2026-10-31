@@ -1,9 +1,9 @@
 """hermes-vpn: let the agent choose which way its browser leaves.
 
-Registers fourteen tools (``net_exits``, ``net_use``, ``net_where``, ``net_places``,
-``net_providers``, ``net_provider_setup``, ``net_open``, ``net_close``, ``net_lock``,
-``net_failover``, ``net_tor_connect``, ``net_new_circuit``, ``net_doctor``,
-``net_harden``) and the ``hermes vpn`` command. An exit is a local proxy; gluetun containers are
+Registers fourteen tools (``vpn_exits``, ``vpn_use``, ``vpn_where``, ``vpn_places``,
+``vpn_providers``, ``vpn_provider_setup``, ``vpn_open``, ``vpn_close``, ``vpn_lock``,
+``vpn_failover``, ``vpn_tor_connect``, ``vpn_new_circuit``, ``vpn_doctor``,
+``vpn_harden``) and the ``hermes vpn`` command. An exit is a local proxy; gluetun containers are
 discovered automatically, anything else is listed in a file.
 
 Nothing here implements a tunnel. The point of the plugin is the part that was
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 __version__ = "0.2.0"
 
-TOOLSET = "net_exits"
+TOOLSET = "vpn_exits"
 
 
 def _schema(name: str, description: str, properties: dict[str, Any], required=None) -> dict[str, Any]:
@@ -40,23 +40,35 @@ def _schema(name: str, description: str, properties: dict[str, Any], required=No
     return {"name": name, "description": description, "parameters": params}
 
 
+#: The first thing an agent reads about any of these tools. Two plugins on
+#: this host moved "the agent's browser" and said so in the same words: a
+#: measured run asked for Mexico, got this family, moved the sandbox and read
+#: Madrid back (nlbench, 2026-10-31). The names differ now and so does the
+#: first clause of every description.
+MINE = (
+    "Moves THIS BOT'S OWN network -- its sandbox, its terminal and the browser built "
+    "into the agent. It does NOT move a geobrowse browser: those have their own exits "
+    "and their own net_* tools, one per browser. If the request is about what a web "
+    "page sees, it is probably the other family. "
+)
+
+
 NET_EXITS_SCHEMA = _schema(
-    "net_exits",
-    "List the network exits the agent's browser can leave by, and which one is in use. "
+    "vpn_exits",
+    "Lists the exits this bot's network can leave by, and which one is in use. "
     "Each exit is a local proxy with a name and usually a country. Call this before "
-    "net_use when you do not know the exact names.",
+    "vpn_use when you do not know the exact names.",
     {},
 )
 
 NET_USE_SCHEMA = _schema(
-    "net_use",
-    "Send the agent's browser out through one of the exits — use this when someone asks "
-    "to browse from another country. The exit is checked first and the switch is "
+    "vpn_use",
+    "Sends this bot's own traffic out through one of the exits. The exit is checked first and the switch is "
     "abandoned if it does not answer, so a dropped tunnel never leaves the browser "
     "quietly on the server's own address. The running browser is closed so the next page "
     "loads through the new exit; pass 'direct' to stop using a proxy at all. The answer "
     "reports the address and place the far end actually saw, which is what you should "
-    "repeat back — not the exit's label. To browse by Tor, call net_tor_connect instead: "
+    "repeat back — not the exit's label. To browse by Tor, call vpn_tor_connect instead: "
     "selecting the Tor exit here gives the exit without the mode, so the session, the "
     "cookies and JavaScript stay as they were.",
     {
@@ -81,7 +93,7 @@ NET_USE_SCHEMA = _schema(
 )
 
 NET_WHERE_SCHEMA = _schema(
-    "net_where",
+    "vpn_where",
     "Check where the agent's browser appears to be right now, by making a request and "
     "reading back the address the far end saw. Use it to answer 'where am I browsing "
     "from', and whenever a site behaves as if it dislikes the connection — a datacenter "
@@ -108,27 +120,27 @@ def handle_use(args: dict[str, Any], **_kw: Any) -> str:
 
 
 NET_OPEN_SCHEMA = _schema(
-    "net_open",
+    "vpn_open",
     "Bring up a new exit in a country or city that is not running yet, and switch to it. "
     "Use this when someone names a place the existing exits do not cover — "
     "'connect to a server in Miami'. Say that bringing a tunnel up takes tens of seconds "
-    "and that you will report back when it answers, then call this; prefer net_use when "
+    "and that you will report back when it answers, then call this; prefer vpn_use when "
     "an exit for that place already exists. On a timeout the helper keeps going as root, "
-    "so the exit can still turn up afterwards: net_exits settles that, not a second "
-    "net_open. The new exit stays up until it is closed with net_close.",
+    "so the exit can still turn up afterwards: vpn_exits settles that, not a second "
+    "vpn_open. The new exit stays up until it is closed with vpn_close.",
     {
         "place": {
             "type": "string",
             "description": (
                 "One place name on its own: 'Mexico', 'Miami', 'New York'. No commas, no "
                 "country code, nothing like 'Miami, USA' — the helper refuses those, and "
-                "net_places says how this provider spells it."
+                "vpn_places says how this provider spells it."
             ),
         },
         "provider": {
             "type": "string",
             "description": (
-                "Which configured VPN to use. net_providers lists them, and when it "
+                "Which configured VPN to use. vpn_providers lists them, and when it "
                 "lists more than one, ask which subscription rather than letting it "
                 "default: the answer names the exit, not the provider behind it."
             ),
@@ -150,8 +162,8 @@ NET_OPEN_SCHEMA = _schema(
 )
 
 NET_CLOSE_SCHEMA = _schema(
-    "net_close",
-    "Shut down an exit that was opened with net_open and free its resources. Only exits "
+    "vpn_close",
+    "Shut down an exit that was opened with vpn_open and free its resources. Only exits "
     "created by the helper can be closed; ones defined in the host's own configuration are "
     "left alone. On a host with more than one profile this refuses when another profile's "
     "browser is going through that exit, and names it: ask that person before passing "
@@ -161,7 +173,7 @@ NET_CLOSE_SCHEMA = _schema(
         "name": {
             "type": "string",
             "description": (
-                "The exit's name, as net_exits lists it. Only exits this plugin created "
+                "The exit's name, as vpn_exits lists it. Only exits this plugin created "
                 "(named 'exit-...') can be closed; one started by hand is left alone."
             ),
         },
@@ -178,7 +190,7 @@ NET_CLOSE_SCHEMA = _schema(
 
 
 NET_PLACES_SCHEMA = _schema(
-    "net_places",
+    "vpn_places",
     "Ask which countries and cities a VPN provider offers, before trying to open an exit "
     "there. With no search term it summarises and lists the countries; with one it returns "
     "the matching countries and cities. The provider defaults to the one the running exits "
@@ -208,7 +220,7 @@ def handle_places(args: dict[str, Any], **_kw: Any) -> str:
 
 
 NET_PROVIDERS_SCHEMA = _schema(
-    "net_providers",
+    "vpn_providers",
     "Which VPN providers this host has credentials for, and which ones there are setup "
     "guides for. Ask this when someone mentions a VPN by name and you do not know whether "
     "it is set up here, and again right after they have added one, to confirm it is now "
@@ -217,7 +229,7 @@ NET_PROVIDERS_SCHEMA = _schema(
 )
 
 NET_PROVIDER_SETUP_SCHEMA = _schema(
-    "net_provider_setup",
+    "vpn_provider_setup",
     "Explain how to set up a particular VPN provider: which values it needs, where in that "
     "provider's dashboard to find them, and the configuration that uses them. Answers from "
     "guides shipped with the plugin, so it works without searching the web. Use it whenever "
@@ -227,7 +239,7 @@ NET_PROVIDER_SETUP_SCHEMA = _schema(
     "Terminal tab in Hermes Desktop or the dashboard, or their shell over SSH) and paste the "
     "config there. If they offer to paste the credentials to you in chat, decline and point "
     "them back to that terminal — the key must not pass through this conversation. When they "
-    "say it is done, call net_providers to confirm it is configured, then offer to open an "
+    "say it is done, call vpn_providers to confirm it is configured, then offer to open an "
     "exit for it.",
     {
         "provider": {
@@ -240,7 +252,7 @@ NET_PROVIDER_SETUP_SCHEMA = _schema(
 
 
 NET_LOCK_SCHEMA = _schema(
-    "net_lock",
+    "vpn_lock",
     "Arm or disarm the kill switch — what people also call security mode, safe mode or "
     "'modo seguridad'. Armed, the agent's browser may only leave by a selected exit: if "
     "that exit stops answering, browser tools are refused rather than quietly allowed out "
@@ -261,13 +273,13 @@ NET_LOCK_SCHEMA = _schema(
 
 
 NET_FAILOVER_SCHEMA = _schema(
-    "net_failover",
+    "vpn_failover",
     "Arm or disarm failover, which is off by default, and name the standby exit it moves "
     "to. The standby is chosen by the person, not guessed: ask which city or country they "
     "want it to come out of, preferably on a different VPN provider so that a subscription "
     "failing does not take both. Call this with armed=true and no standby to find out what "
     "is missing — it answers with the providers configured here and does not arm until one "
-    "is chosen. Open the exit first with net_open, then name it here. It has to stay "
+    "is chosen. Open the exit first with vpn_open, then name it here. It has to stay "
     "running: bringing a tunnel up takes tens of seconds and a browser call cannot wait. "
     "If the standby is down too when it is needed, the call is refused and the kill switch "
     "holds the browser. Tor is never a standby.",
@@ -279,7 +291,7 @@ NET_FAILOVER_SCHEMA = _schema(
         "standby": {
             "type": "string",
             "description": (
-                "The exit that takes over, by name, as net_exits lists it. It is checked "
+                "The exit that takes over, by name, as vpn_exits lists it. It is checked "
                 "when named: one that does not answer is refused rather than remembered."
             ),
         },
@@ -289,14 +301,14 @@ NET_FAILOVER_SCHEMA = _schema(
 
 
 NET_TOR_CONNECT_SCHEMA = _schema(
-    "net_tor_connect",
+    "vpn_tor_connect",
     "Connect through Tor and wait until the circuit actually carries something, before "
     "any browser is pointed at it. This also puts the browser in Tor mode: its cookies "
     "and sessions are cleared on the way in and again on the way out, JavaScript is off "
     "unless asked for, and device permissions are denied. It does not open .onion "
     "addresses on its own: resolving one needs a person to run `hermes vpn allow-onion` "
     "in a terminal once (it restarts Hermes for them), and until they do, onion names stay "
-    "refused -- tell the person that exact command; the answer and net_doctor repeat it. "
+    "refused -- tell the person that exact command; the answer and vpn_doctor repeat it. "
     "While it is on, this plugin refuses internal addresses in Hermes' place. "
     "Ask before calling it: entering Tor mode closes the browser and sets its cookies and "
     "sessions aside, so every logged-in site is logged out. In a profile whose browser "
@@ -335,7 +347,7 @@ NET_TOR_CONNECT_SCHEMA = _schema(
             "description": (
                 "End Tor mode instead of starting it: clears the browser again, puts "
                 "JavaScript and the internal-address refusal back, and leaves the exit "
-                "for you to choose with net_use."
+                "for you to choose with vpn_use."
             ),
         }
     },
@@ -343,9 +355,9 @@ NET_TOR_CONNECT_SCHEMA = _schema(
 
 
 NET_NEW_CIRCUIT_SCHEMA = _schema(
-    "net_new_circuit",
+    "vpn_new_circuit",
     "Ask Tor for another exit node, when a site refuses the one in use. This is a Tor "
-    "idea and only works on a Tor exit: a VPN exit is moved with net_use or net_open "
+    "idea and only works on a Tor exit: a VPN exit is moved with vpn_use or vpn_open "
     "instead. The exit is measured before and after, and the answer says whether the "
     "address actually changed, because Tor coalesces these requests within about ten "
     "seconds and two asks in a row can honestly produce one new circuit.",
@@ -361,7 +373,7 @@ NET_NEW_CIRCUIT_SCHEMA = _schema(
 
 
 NET_DOCTOR_SCHEMA = _schema(
-    "net_doctor",
+    "vpn_doctor",
     "Check what is protecting this agent's browsing and what is not: exits, whether the "
     "browser is using one, the WebRTC protections, the kill switch, and whether a "
     "sandboxed profile's browser (where a Bot Screen runs) is tunnelled or leaking. Each "
@@ -538,7 +550,7 @@ def handle_open(args: dict[str, Any], **_kw: Any) -> str:
         return f"Could not open an exit in {place or 'that place'}: {reason}.{hint}"
 
     if args.get("switch") is False:
-        return f"{said}\nIt is up but not in use; switch with net_use."
+        return f"{said}\nIt is up but not in use; switch with vpn_use."
     try:
         return f"{said}\n" + netexits.switch(name)
     except netexits.ExitError as exc:
@@ -562,9 +574,9 @@ def handle_where(args: dict[str, Any], **_kw: Any) -> str:
 
 
 NET_HARDEN_SCHEMA = _schema(
-    "net_harden",
+    "vpn_harden",
     "Install the browser-wide WebRTC policy, so the protection cannot be lost if something "
-    "changes how the browser is launched. net_doctor asks for this when it is missing. It "
+    "changes how the browser is launched. vpn_doctor asks for this when it is missing. It "
     "needs the root helper, and it only covers the browser on this host: a profile whose "
     "terminal is a container has its own browser, covered by the policy inside it.",
     {},
@@ -579,21 +591,45 @@ def handle_harden(args: dict[str, Any], **_kw: Any) -> str:
 
 
 TOOLS = (
-    ("net_exits", NET_EXITS_SCHEMA, handle_list, "🚪"),
-    ("net_places", NET_PLACES_SCHEMA, handle_places, "🗺️"),
-    ("net_doctor", NET_DOCTOR_SCHEMA, handle_doctor, "🩺"),
-    ("net_lock", NET_LOCK_SCHEMA, handle_lock, "🔒"),
-    ("net_failover", NET_FAILOVER_SCHEMA, handle_failover, "🪂"),
-    ("net_tor_connect", NET_TOR_CONNECT_SCHEMA, handle_tor_connect, "🧅"),
-    ("net_new_circuit", NET_NEW_CIRCUIT_SCHEMA, handle_new_circuit, "🎲"),
-    ("net_providers", NET_PROVIDERS_SCHEMA, handle_providers, "🔌"),
-    ("net_provider_setup", NET_PROVIDER_SETUP_SCHEMA, handle_provider_setup, "📘"),
-    ("net_open", NET_OPEN_SCHEMA, handle_open, "🛫"),
-    ("net_close", NET_CLOSE_SCHEMA, handle_close, "🛬"),
-    ("net_use", NET_USE_SCHEMA, handle_use, "🧭"),
-    ("net_where", NET_WHERE_SCHEMA, handle_where, "📍"),
-    ("net_harden", NET_HARDEN_SCHEMA, handle_harden, "🧱"),
+    ("vpn_exits", NET_EXITS_SCHEMA, handle_list, "🚪"),
+    ("vpn_places", NET_PLACES_SCHEMA, handle_places, "🗺️"),
+    ("vpn_doctor", NET_DOCTOR_SCHEMA, handle_doctor, "🩺"),
+    ("vpn_lock", NET_LOCK_SCHEMA, handle_lock, "🔒"),
+    ("vpn_failover", NET_FAILOVER_SCHEMA, handle_failover, "🪂"),
+    ("vpn_tor_connect", NET_TOR_CONNECT_SCHEMA, handle_tor_connect, "🧅"),
+    ("vpn_new_circuit", NET_NEW_CIRCUIT_SCHEMA, handle_new_circuit, "🎲"),
+    ("vpn_providers", NET_PROVIDERS_SCHEMA, handle_providers, "🔌"),
+    ("vpn_provider_setup", NET_PROVIDER_SETUP_SCHEMA, handle_provider_setup, "📘"),
+    ("vpn_open", NET_OPEN_SCHEMA, handle_open, "🛫"),
+    ("vpn_close", NET_CLOSE_SCHEMA, handle_close, "🛬"),
+    ("vpn_use", NET_USE_SCHEMA, handle_use, "🧭"),
+    ("vpn_where", NET_WHERE_SCHEMA, handle_where, "📍"),
+    ("vpn_harden", NET_HARDEN_SCHEMA, handle_harden, "🧱"),
 )
+
+
+#: Appended to all fourteen descriptions, below, rather than written into each
+#: one: a tool added later cannot be registered without it. The opener (MINE)
+#: only goes on the ones that really move an exit -- vpn_places answers which
+#: countries a provider offers and moves nothing, and a description claiming
+#: otherwise would be a lie in the one place an agent reads to choose.
+FAMILY = (
+    " || This is the bot's own VPN family (vpn_*). A geobrowse browser's country "
+    "is moved with that browser's own net_use, which is a different tool on a "
+    "different thing; if the question is what a web page sees, use that one."
+)
+
+#: The ones that really move an exit. They get MINE as their first clause;
+#: the rest only get FAMILY, because vpn_places and vpn_providers answer
+#: questions and move nothing.
+MOVERS = frozenset({"vpn_exits", "vpn_use", "vpn_where", "vpn_open", "vpn_close",
+                    "vpn_tor_connect", "vpn_new_circuit"})
+
+for _n, _s, _h, _e in TOOLS:
+    if _n in MOVERS and MINE not in _s["description"]:
+        _s["description"] = MINE + _s["description"]
+    if FAMILY not in _s["description"]:
+        _s["description"] += FAMILY
 
 
 def _setup_cli(parser) -> None:

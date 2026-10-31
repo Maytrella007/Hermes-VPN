@@ -380,6 +380,38 @@ class ThePluginLoads(_Base):
             self.assertTrue(callable(tool["handler"]))
             self.assertIn("schema", tool)
 
+    def test_no_tool_is_named_net_anything_any_more(self) -> None:
+        """The names belong to the browser plugin on this host, not to us.
+
+        geobrowse is an MCP server that exposes its own net_exits, net_use,
+        net_where and the rest -- one set per browser it runs -- and both
+        families used to be in reach of the same agent, with descriptions that
+        both said "the agent's browser". Asked to browse from Mexico, the agent
+        took this family, moved the sandbox and read Madrid back from ipinfo
+        (nlbench, 2026-10-31). It noticed and retried; the point is that it
+        could just as easily have reported Madrid.
+        """
+        ctx = self._Ctx()
+        plugin.register(ctx)
+        names = [t["name"] for t in ctx.tools]
+        self.assertEqual([n for n in names if n.startswith("net_")], [])
+        self.assertTrue(all(n.startswith("vpn_") for n in names), names)
+        # Every one of them names its family, so a tool added later cannot be
+        # registered without the discriminator (it is appended, not typed).
+        for tool in ctx.tools:
+            said = tool["schema"]["description"]
+            self.assertIn("geobrowse", said, f"{tool['name']} does not name the other family")
+            self.assertIn("vpn_*", said, tool["name"])
+        # And the ones that really move an exit say so in their first clause,
+        # which is what an agent reads to choose. Not vpn_places and friends:
+        # they move nothing and must not claim to.
+        movers = {"vpn_use", "vpn_open", "vpn_close", "vpn_tor_connect",
+                  "vpn_new_circuit", "vpn_exits", "vpn_where"}
+        for tool in ctx.tools:
+            if tool["name"] in movers & set(names):
+                self.assertIn("THIS BOT'S OWN", tool["schema"]["description"][:400],
+                              f"{tool['name']} does not say what it moves")
+
     def test_a_broken_saved_state_does_not_block_the_load(self) -> None:
         """The decision this encodes was hidden behind a `pragma: no cover`."""
         real = netexits.reapply_saved_choice
@@ -643,7 +675,12 @@ class TheVaultReferencePath(_Base):
         ctx = ThePluginLoads._Ctx()
         plugin.register(ctx)
         names = [t["name"] for t in ctx.tools]
+        # Both spellings: the tools were renamed net_* -> vpn_* when a browser
+        # plugin turned up with the same names, and an absence asserted under
+        # the old spelling alone would not have noticed a new tool under the
+        # new one.
         self.assertNotIn("net_add_provider", names)
+        self.assertNotIn("vpn_add_provider", names)
         self.assertFalse(hasattr(plugin, "handle_add_provider"))
 
     def test_the_cli_from_ref_explains_then_writes_on_yes(self) -> None:
@@ -779,7 +816,9 @@ class TheAllowOnionCommand(unittest.TestCase):
         ctx = ThePluginLoads._Ctx()
         plugin.register(ctx)
         self.assertNotIn("allow-onion", [t["name"] for t in ctx.tools])
-        self.assertNotIn("net_allow_onion", [t["name"] for t in ctx.tools])
+        names = [t["name"] for t in ctx.tools]
+        self.assertNotIn("net_allow_onion", names)
+        self.assertNotIn("vpn_allow_onion", names)
 
 
 if __name__ == "__main__":
